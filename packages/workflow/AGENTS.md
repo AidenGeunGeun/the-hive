@@ -5,7 +5,7 @@ Pure state machine reducer. Zero side effects.
 ## Owns
 
 - Task lifecycle: submitted -> running -> awaiting_review -> approved/rejected/failed/cancelled.
-- Internal phases: mini_rooms -> synthesis -> query_back -> rendering -> rerun.
+- Internal phases: mini_rooms -> synthesis -> [query_back -> synthesis] -> rendering -> rerun.
 - Escalation logic (ledger handoff between stages).
 - Query-back job emission.
 

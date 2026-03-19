@@ -239,7 +239,7 @@ Shared internal contracts:
 - Room health types
 - QueryResponseArtifact type
 
-Enforcement: package.json exports restrict what can be imported. Lint rules and CI checks verify that cli only imports from `protocol/wire`. Documented in AGENTS.md.
+Enforcement: package.json exports restrict what can be imported. CI checks (grep-based boundary validation in `.github/workflows/ci.yml`) verify that cli only imports from `protocol/wire` and no package imports server. Documented in AGENTS.md.
 
 ## Persistence
 
@@ -266,7 +266,7 @@ Enforcement: package.json exports restrict what can be imported. Lint rules and 
 
 ## Package Structure
 
-10 packages. Each has one responsibility.
+9 packages + 1 non-package test directory. Each has one responsibility.
 
 ### Dependency Graph
 
