@@ -19,7 +19,7 @@ bun run check        # Lint + format check (biome)
 bun run check:fix    # Lint + format fix
 bun run typecheck    # TypeScript type checking across all packages
 bun run test         # Run all tests
-bun run test:pkg <name>  # Run tests for a specific package
+bun run test:pkg @the-hive/<name>  # Run tests for a specific package
 ```
 
 From a package directory:
@@ -41,9 +41,14 @@ bun test             # Run this package's tests only
 ## Testing
 
 - Vitest for all packages.
-- Run the specific package test after changes: `bun run test:pkg <name>`.
+- Run all tests: `bun run test`.
+- Run one package's tests: `bun run test:pkg @the-hive/<name>` (e.g., `bun run test:pkg @the-hive/room`).
+- From a package directory: `bun test`.
 - If you modify a test file, run it and iterate until it passes.
-- Integration tests live in `test/eval/`. Do not run these without asking.
+
+### Evaluation Tests
+
+`test/eval/` contains integration-level evaluation tests: golden tasks, single-agent baselines, replay from turn traces, artifact scoring, cost/latency metrics. These are expensive (real LLM calls, real cost). Do not run these without asking.
 
 ## Architecture — Hard Boundary Rules
 
@@ -92,6 +97,16 @@ Agents in deliberation rooms can ONLY:
 - Emit structured turns (typed actions)
 
 Agents CANNOT: read files, write files, execute commands, auto-discover extensions, access the network. The Hive does NOT use pi-mono's agent runtime. Only `pi-ai` for provider abstraction.
+
+## Prompts
+
+`prompts/` contains system prompts for deliberation agents. These are injected at room start, not at build time.
+
+- `prompts/room-base.md` — Base adversarial rules shared by all deliberation agents.
+- `prompts/personas/*.md` — Domain-specific focus areas (frontend, backend, database, etc.).
+- `prompts/team-lead.md` — Synthesis room rules for cross-domain integration.
+
+When modifying prompts: these directly affect agent behavior in rooms. Changes here are design decisions, not code changes. Do not add tool definitions or capability grants — agents are sealed (see Sealed Agent Boundary above).
 
 ## Git Rules
 
