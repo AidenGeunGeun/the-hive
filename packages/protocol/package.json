@@ -1,0 +1,22 @@
+{
+  "name": "@the-hive/protocol",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": {
+    "./wire": "./dist/wire/index.js",
+    "./engine": "./dist/engine/index.js"
+  },
+  "typesVersions": {
+    "*": {
+      "wire": ["./dist/wire/index.d.ts"],
+      "engine": ["./dist/engine/index.d.ts"]
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
