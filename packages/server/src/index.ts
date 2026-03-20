@@ -1,1 +1,1 @@
-// @the-hive/server
+export {};

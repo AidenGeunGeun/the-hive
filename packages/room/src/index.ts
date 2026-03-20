@@ -1,1 +1,1 @@
-// @the-hive/room
+export {};

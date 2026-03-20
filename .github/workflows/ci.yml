@@ -21,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: CLI must not import protocol/engine
+      - name: CLI may import only protocol/wire
         run: |
-          if grep -r "protocol/engine" packages/cli/src/; then
-            echo "ERROR: cli must only import from protocol/wire"
+          if grep -r "@the-hive/" packages/cli/src/ | grep -E -v "@the-hive/protocol/wire['\"]"; then
+            echo "ERROR: cli must only import from @the-hive/protocol/wire"
             exit 1
           fi
       - name: No package imports server
@@ -32,6 +32,22 @@ jobs:
           for pkg in protocol config context providers room workflow storage cli; do
             if grep -r "@the-hive/server" "packages/$pkg/src/" 2>/dev/null; then
               echo "ERROR: packages/$pkg imports server"
+              exit 1
+            fi
+          done
+      - name: Only providers may import pi-ai
+        run: |
+          for pkg in protocol config context room workflow storage cli server; do
+            if grep -r "@mariozechner/pi-ai" "packages/$pkg/src/" 2>/dev/null; then
+              echo "ERROR: only packages/providers may import @mariozechner/pi-ai"
+              exit 1
+            fi
+          done
+      - name: Only storage may import bun:sqlite
+        run: |
+          for pkg in protocol config context providers room workflow cli server; do
+            if grep -r "bun:sqlite" "packages/$pkg/src/" 2>/dev/null; then
+              echo "ERROR: only packages/storage may import bun:sqlite"
               exit 1
             fi
           done

@@ -1,13 +1,18 @@
 {
   "name": "the-hive",
   "private": true,
+  "packageManager": "bun@1.3.10",
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
     "build": "turbo run build",
     "check": "biome check .",
+    "check-boundaries": "bash ./scripts/check-boundaries.sh",
+    "check-no-default-exports": "bun run check",
+    "check-no-explicit-any": "bun run check",
     "check:fix": "biome check --write .",
+    "lint": "bun run check",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "test:pkg": "turbo run test --filter"

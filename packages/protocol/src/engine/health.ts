@@ -1,1 +1,0 @@
-// RoomHealth, HealthStatus types
