@@ -10,6 +10,8 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@mariozechner/pi-ai": "^0.61.0",
+    "@sinclair/typebox": "^0.34.48",
     "@the-hive/protocol": "workspace:*"
   },
   "devDependencies": {

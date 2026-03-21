@@ -514,11 +514,15 @@ Swap fake agents for real `pi-ai`-backed agents in a headless harness.
 
 ### Provider package interfaces
 
-- `createProviderRegistry(config): ProviderRegistry`
+- `createProviderRegistry(registryConfig: ProviderRegistryConfig): ProviderRegistry`
 - `createProviderAgent(spec, runtimeDeps): Agent`
 - `resolveModel(selection): ModelHandle`
 - `runProviderTurn(input): Promise<ProviderTurnResult>`
 - `normalizeToolCall(toolCall): ParsedTurn | ProviderNormalizationError`
+
+`ProviderRegistryConfig` is a providers-local runtime contract. The server maps validated `@the-hive/config` objects into this shape at composition time. `providers` does not import `config`.
+
+`ProviderAgentDeps` (the `runtimeDeps` argument) includes `registry`, `complete` (injectable pi-ai completion function), and `roomKind` (for room-kind-aware tool schema selection).
 
 ```ts
 interface ProviderCapability {
