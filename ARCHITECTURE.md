@@ -7,9 +7,9 @@ The Hive is a multi-agent deliberation system. It produces architectural proposa
 ## Core Philosophy
 
 - Deliberation and implementation are separate systems. The Hive only deliberates.
-- Agents reason from curated documentation (ContextBundles), never raw code.
+- Agents are tool-using agentic loops with read access to the repository. They investigate, reason, and discuss.
 - Human approval gates all implementation.
-- The output is a structured decision ledger and rendered proposal artifact, not code.
+- The output is an extracted room summary with evidence, rendered as a review packet. Not code.
 
 ## Architecture Overview
 
@@ -19,50 +19,110 @@ Two deliberation stages + human gate.
 
 3-5 agents per room, domain-scoped (frontend, backend, database, infra, etc.).
 
-- Single-provider by default. Multi-provider is opt-in.
-- Agents receive an immutable ContextBundle. No filesystem, no shell, no network, no auto-discovery.
-- Agent tools are structured deliberation actions (see Ledger Action Vocabulary).
+- Each agent is a Pi instance running a bounded agentic loop with read-only repo tools.
+- Agents explore the codebase within their domain scope, read what they need, and form positions.
 - Adversarial system prompts: agents must find flaws before agreeing, no empty agreement.
-- Output: structured issue/decision ledger, rendered as report.md.
+- Each turn produces a natural language contribution with lightweight structured signals (stance, blockers, cited files).
+- Room summary is extracted from the conversation transcript after the room concludes.
+- Output: extracted RoomSummary + full transcript for audit.
 
 ### Stage 2: Synthesis Room
 
 One stronger model per domain.
 
-- Input: ledgers from Stage 1 rooms.
+- Input: Stage 1 room summaries (not full transcripts by default).
 - Focus: cross-system integration, API contracts, data flow, shared infrastructure.
+- Synthesis agents also run agentic loops with read-only repo access.
 - Can issue `query_room` jobs to Stage 1 rooms for targeted clarification (see Query-Back).
-- Same kernel, different policies.
-- Output: synthesis ledger, rendered as review packet with final_proposal.md.
+- Output: synthesis summary, rendered as review packet with final_proposal.md.
 
 ### Human Gate
 
 The human receives a review packet containing:
 
 - Proposal artifact (final_proposal.md)
-- Unresolved issues
-- Dissent (risk_proposed items for human decision)
-- Context gaps flagged by agents (request_context items)
-- Evidence trace links
+- Unresolved issues with transcript references
+- Dissent (risks proposed for human decision)
+- Context gaps flagged by agents
+- Evidence trace links (cited file spans with repo snapshot refs)
+- Extraction confidence score and coverage warnings
 - Diff from prior version (if rerun)
 
 The human approves, rejects with feedback, or cancels. Rejection loops back to Stage 1 with feedback injected. Max iteration cap prevents infinite deliberation.
 
 The human gate is NOT a deliberation tier. It is an approval checkpoint.
 
+## Agent Model
+
+### Agents Are Pi Instances
+
+Each deliberation agent is a Pi instance — a bounded agentic loop powered by `pi-ai`.
+
+An agent's turn is not a single completion call. It is a loop: the agent reads files, reasons, reads more, and produces its contribution when ready. The loop is bounded by wall-clock time and max rounds. Within those bounds, the agent has autonomy over what it reads and how it reasons.
+
+### Read-Only Repo Access
+
+Agents can:
+- Read files in the repository (scoped to their domain by path policy)
+- List directories
+- Read the conversation transcript so far (other agents' contributions)
+
+Agents cannot:
+- Write or modify files
+- Execute shell commands
+- Access the network
+- Write to storage or any persistent state
+
+The Hive uses `pi-ai` for model API abstraction. The agent runtime provides read-only tools and manages the agentic loop. All durable state is owned by the server, not by Pi sessions.
+
+### Turn Structure
+
+Each turn produces a contribution with lightweight structured signals:
+
+```
+TurnContribution {
+  bodyMarkdown: string          // natural language — the agent's full position
+  citedFiles: FileSpanRef[]     // files read and referenced as evidence
+  stance: "support" | "object" | "uncertain"
+  wantsClosure: boolean         // signal for convergence detection
+  blockers: string[]            // explicit unresolved concerns
+}
+```
+
+The body is natural language. The signals are for the room kernel's stop policy. This replaces the previous 8-action ledger vocabulary as per-turn output.
+
+### Graceful Failure
+
+If an agent's loop fails (provider error, timeout, crash), the runtime should:
+1. Attempt to resume from the last stable point in the loop.
+2. If resume fails, mark the agent as degraded for this turn.
+3. If an agent fails repeatedly, mark it as failed. Room health checks apply.
+
 ## Room: Kernel + Policy
 
-The room is split into a shared kernel and pluggable policies.
+The room kernel is deterministic in its **outer scheduling** and non-deterministic only **inside each agent's turn runtime**.
 
 ### Kernel (invariant across all room types)
 
-- Deterministic turn sequencing (replayable)
-- Append-only ledger management
-- Raw turn trace capture (separate from ledger)
-- Agent lifecycle (spawn, context injection, turn collection, teardown)
+- Deterministic turn sequencing (round-robin scheduling is replayable)
+- Conversation transcript management (append contributions, build context for next agent)
+- Turn trace capture (full agentic loop traces, not just final output)
+- Agent lifecycle (create runtime handle, inject context, run turn, collect contribution, teardown)
 - Max_rounds enforcement
 - Room health monitoring (active agent count vs minHealthyAgents)
-- Semantic action validation (beyond schema: target issue exists, closure is legal, duplicate suppression, repeated closure cooldown)
+- Wall-clock budget enforcement per turn and per room
+
+### Turn Flow
+
+For each turn, the kernel passes a TurnBrief to the agent runtime:
+
+- Task prompt and persona
+- Conversation transcript so far (previous agents' contributions)
+- Repo snapshot reference
+- Domain-scoped path allowlist
+- Wall-clock budget
+
+The runtime executes the Pi loop and returns a TurnContribution.
 
 ### Policies (pluggable per room type)
 
@@ -70,118 +130,81 @@ The room is split into a shared kernel and pluggable policies.
 v1: deterministic round-robin.
 
 **StopPolicy** — when is the room done.
-v1: all issues resolved/deferred/risk_proposed AND no open objections from healthy agents, OR max_rounds, OR room health below quorum.
+v1: stop when all healthy agents signal `support` or `support with reservations` and no high-severity blockers remain, or when no new issues were raised in the last full round, or max_rounds, or room health below quorum.
 
-Closure mechanic: any agent can `propose_closure`. Closure finalizes only when no healthy agent has an open objection. Repeated identical closure proposals are rejected unless ledger state has changed since the last attempt.
-
-**MemoryPolicy** — what context each agent sees per turn.
-v1 default: unresolved-issue-scoped.
-- Full ledger status (all issue titles + current states)
-- Detailed history for unresolved issues only
-- Resolved issues appear as status-only summaries
-- System prompt + context bundle always included
+**MemoryPolicy** — what conversation context each agent sees per turn.
+v1: full transcript of all contributions. Agents manage their own relevance filtering through what they choose to read and respond to.
 
 **FailurePolicy** — what happens on agent error.
-v1: retry once, then mark agent as failed. If active agents drop below minHealthyAgents, terminate room with `inconclusive_due_to_health`.
+v1: attempt resume, then retry once, then mark agent as failed. If active agents drop below minHealthyAgents, terminate room with `inconclusive_due_to_health`.
 
 **ArtifactPolicy** — output structure.
-Domain rooms: ledger rendered as report.md.
-Synthesis room: ledger rendered as review packet with final_proposal.md.
+Domain rooms: extracted RoomSummary.
+Synthesis room: extracted synthesis summary, rendered as review packet.
 
-## Structured Issue/Decision Ledger
+## Room Summary Extraction
 
-The ledger is the truth source for decisions. Reports are deterministic renders.
+After a room conversation concludes, structured data is extracted from the transcript. This is a multi-stage process, not a single summarizer pass.
 
-### Action Vocabulary (v1 — 8 actions)
+### Extraction Pipeline
 
-```
-create_issue(title, description, assumptions?)
-  Opens a new issue. Creator attributed. Optional assumptions recorded inline.
+1. **Turn-local extraction** — After each turn, extract candidate issues, decisions, risks, objections, and evidence references.
+2. **Room reducer** — Merge turn-level candidates into a canonical RoomSummary.
+3. **Coverage validator** — A second pass checking: "What did the reducer miss? What disagreements remain? Which claims lack evidence?"
 
-challenge(targetIssueId, argument, evidence?)
-  Counterargument targeting a specific issue. Voids any pending propose_closure on that issue.
-
-propose_resolution(targetIssueId, proposal, evidence?)
-  Concrete solution for an issue.
-
-propose_closure(targetIssueId, rationale, closureType: "resolved" | "deferred" | "risk_proposed")
-  Any agent can propose closing an issue.
-  Closure finalizes when no healthy agent has an open objection.
-  "risk_proposed" means the agent proposes accepting the risk. Only human review
-  can transition this to "risk_accepted."
-  Repeated identical proposals are rejected unless ledger state changed.
-
-reopen_issue(targetIssueId, reason, newEvidence?)
-  Reopen a previously closed issue with new information.
-
-request_context(description, justification)
-  Agent explicitly signals missing context. Logged in ledger.
-  Surfaced in review packet as a context gap.
-
-record_decision(targetIssueId?, decision, rationale, rejectedAlternatives?)
-  Records a design decision with rationale and rejected alternatives.
-
-link_issues(sourceId, targetId, relation: "blocks" | "depends_on" | "duplicates")
-  Establishes a relationship between issues.
-```
-
-### Issue Lifecycle
+### Canonical Room Output
 
 ```
-open -> challenged -> proposed_resolution -> closure_proposed -> resolved / deferred / risk_proposed
+RoomSummary {
+  roomId: string
+  outcome: "completed" | "inconclusive"
+  issues: IssueSummary[]          // identified concerns
+  decisions: DecisionSummary[]    // resolved decisions with rationale
+  risks: RiskSummary[]            // proposed risks for human decision
+  contextGaps: ContextGap[]       // missing information flagged by agents
+  dissent: DissentItem[]          // unresolved disagreements
+  evidence: EvidenceRef[]         // file spans, transcript turns, excerpts
+  extractionConfidence: number    // 0-1 confidence score
+  coverageWarnings: string[]      // what the validator flagged
+}
 ```
 
-Any state can return to `open` via `challenge` or `reopen_issue`.
+Every extracted item points to: transcript turn IDs, file path + snapshot ref + line spans, and excerpt snippets.
 
-`risk_proposed` is an agent-side terminal state. Only the human review flow may transition it to `risk_accepted`.
+**Transcript is evidence. Room summary is authority.**
 
-### Multiple Actions Per Turn
+## Context: Repo Snapshots
 
-A turn is a typed object. Multiple actions per turn are allowed (e.g., challenge + counterproposal + evidence in one turn). No artificial bandwidth limitation.
+The `context` package manages repository access for deliberation cycles.
+
+### What Context Provides
+
+- **Repo snapshot** — A fixed reference point for the codebase. All agents in a cycle read from the same snapshot. No mid-deliberation mutations.
+- **Domain scoping** — Path allowlists per domain room. A frontend room sees `packages/frontend/`, `packages/ui/`, shared configs. A backend room sees `packages/api/`, `packages/server/`, etc. Configured, not inferred.
+- **Manifest** — Lightweight metadata: directory tree, package.json dependency graph, file sizes. Available to agents without reading every file.
+
+### What Context Does NOT Do
+
+- Pre-build curated bundles. Agents explore the repo themselves.
+- Parse or interpret file contents. That's the agent's job.
+- Manage embeddings or knowledge graphs. Those may layer on later as optional tools.
+
+Domain scoping is the primary guard against agents reading irrelevant files and wasting tokens. The repo snapshot ensures consistency across the deliberation cycle.
 
 ## Query-Back from Synthesis
 
-When the synthesis room identifies a cross-domain conflict it cannot resolve from ledgers alone:
+When the synthesis room identifies a cross-domain conflict it cannot resolve from room summaries alone:
 
-1. Synthesis agent emits `query_room(targetRoomId, question, relevantIssueIds)`.
+1. Synthesis agent signals a query-back need.
 2. Workflow transitions internal phase: `synthesis` -> `query_back`.
 3. Server dispatches: creates a bounded mini-cycle in the target source room.
-   - Same agents, same context, plus the targeted question.
+   - Same agents, same repo snapshot, plus the targeted question.
    - StopPolicy: answer the question, max 3 rounds.
-4. Source room produces a focused answer as a **versioned QueryResponseArtifact** linked to the source room and issue IDs. This is NOT appended to the original source ledger.
+4. Source room produces a focused answer as a **versioned QueryResponseArtifact**. This is NOT a mutation of the original room summary.
 5. Answer returns to synthesis room's context.
 6. Workflow transitions: `query_back` -> `synthesis`.
 
 Bounded: max query-backs per synthesis session is configurable (default 3).
-
-## Sealed Agent Boundary
-
-Agents in the Hive can:
-- Read their immutable ContextBundle
-- Emit structured turns (typed actions appended to the ledger)
-
-Agents in the Hive cannot:
-- Read arbitrary files
-- Write files
-- Execute shell commands
-- Auto-discover extensions, prompts, or project-local files
-- Access the network
-
-The Hive does NOT use pi-mono's agent-core or coding-agent runtime. It uses `pi-ai` only for model API normalization. The deliberation agent wrapper is purpose-built: context bundle in, typed actions out.
-
-## Context Bundles
-
-Agents consume immutable, versioned ContextBundles. Not repos.
-
-A ContextBundle may include:
-- AGENTS.md content (per domain)
-- API schemas (OpenAPI, GraphQL)
-- Dependency manifests (package.json, go.mod, Cargo.toml)
-- DB schemas
-- Architecture docs
-- Staleness metadata (last-verified timestamps per section)
-
-Built by `@the-hive/context` at task start. Immutable for the duration of a deliberation cycle. Staleness is visible to agents. If agents identify missing context, they emit `request_context` actions.
 
 ## Workflow: Pure Reducer
 
@@ -197,6 +220,8 @@ apply(command, state) -> { newState, events, jobs }
 
 The server calls `apply()`, persists state via storage, dispatches jobs, and broadcasts events.
 
+The workflow does not know or care about agent internals. It sees jobs (`prepare_repo_snapshot`, `run_domain_room`, `run_synthesis_room`, `render_review_packet`) and their completion signals.
+
 ## Task Lifecycle
 
 ### External States (visible to CLI/UI)
@@ -208,7 +233,7 @@ submitted -> running -> awaiting_review -> approved / rejected / failed / cancel
 ### Internal Phases (inside "running")
 
 ```
-mini_rooms -> synthesis -> query_back -> synthesis -> rendering -> rerun
+preparing_snapshot -> mini_rooms -> synthesis -> query_back -> synthesis -> rendering -> rerun
 ```
 
 Rejection loops `running -> awaiting_review` with max iteration cap.
@@ -223,23 +248,23 @@ What crosses process boundaries (server <-> CLI/UI):
 - Task DTOs (external lifecycle states)
 - Commands (submit_task, approve, reject, cancel)
 - Events (task_state_changed, room_started, room_completed)
-- Review packet schema (rendered ledger view, proposal, context gaps, dissent)
+- Review packet schema (extracted summary view, proposal, evidence, dissent)
 - Error codes
 - Protocol version and compatibility
 
 ### `@the-hive/protocol/engine` (internal — can change freely)
 
 Shared internal contracts:
-- Agent interface
+- Agent runtime interface
+- TurnBrief and TurnContribution types
 - Policy interfaces (TurnPolicy, StopPolicy, MemoryPolicy, FailurePolicy, ArtifactPolicy)
-- Full ledger schema (internal detail, includes raw issue graph)
-- Context bundle types
+- RoomSummary and extraction types
 - Room kernel types
-- Turn and action type definitions
 - Room health types
+- Repo snapshot and path policy types
 - QueryResponseArtifact type
 
-Enforcement: package.json exports restrict what can be imported. CI checks (grep-based boundary validation in `.github/workflows/ci.yml`) verify that cli only imports from `protocol/wire` and no package imports server. Documented in AGENTS.md.
+Enforcement: package.json exports restrict what can be imported. CI checks verify that cli only imports from `protocol/wire` and no package imports server.
 
 ## Persistence
 
@@ -248,13 +273,15 @@ Enforcement: package.json exports restrict what can be imported. CI checks (grep
 | Store | Authoritative for | Package |
 |-------|-------------------|---------|
 | Workflow event log | Task state and lifecycle transitions | storage |
-| Ledger store | Decisions, issues, resolutions, evidence | storage |
-| Turn trace store | Raw model outputs, parse results, timing, token usage | storage |
+| Room summaries | Decisions, issues, risks, evidence (extracted) | storage |
+| Room transcripts | Full conversation record (contributions + metadata) | storage |
+| Turn traces | Agent loop internals: LLM calls, tool uses, file reads | storage |
 | Snapshots | Recovery optimization (derived from event log) | storage |
 
 - Workflow event log is the authority for "what state is this task in."
-- Ledger is the authority for "what decisions were made."
-- Turn traces are audit-only. Not consumed by other system components during normal operation.
+- Room summary is the authority for "what decisions were made."
+- Transcripts are the evidence base. Summaries reference them.
+- Turn traces are deep audit. Tool calls, file reads, LLM request/response within each agent loop.
 - Snapshots are a recovery optimization, derived from the event log. Not authoritative.
 
 ### Hard Rules
@@ -263,10 +290,11 @@ Enforcement: package.json exports restrict what can be imported. CI checks (grep
 - Only the `storage` package touches SQLite.
 - Only the `server` writes to storage. All other packages emit events or jobs.
 - Server is the single SQLite writer (no concurrent write contention by design).
+- Pi session state is NOT authoritative. If Pi sessions can be cached/resumed, treat it as optimization, not truth.
 
 ## Package Structure
 
-9 packages + 1 non-package test directory. Each has one responsibility.
+10 packages + 1 non-package test directory.
 
 ### Dependency Graph
 
@@ -274,47 +302,50 @@ Enforcement: package.json exports restrict what can be imported. CI checks (grep
 protocol (base — no deps)
   ^
   |-- config
-  |-- context
-  |-- providers (+ pi-ai)
-  |-- room
+  |-- context         (repo snapshots, manifests, domain scoping)
+  |-- providers       (model registry, pi-ai adapters, pricing/capabilities)
+  |-- agent-runtime   (Pi loop, read-only tools, trace capture, graceful failure)
+  |-- room            (conversation orchestration, turn scheduling, convergence, extraction)
   |-- workflow
   |-- storage
   |-- cli (wire entrypoint only)
   |
-  server (protocol + workflow + storage + config + providers + room + context)
+  server (composition root — all packages)
 ```
 
 ### Hard Boundary Rules
 
 - No package except `storage` touches SQLite.
-- No package except `providers` imports provider SDKs (including pi-ai).
+- No package except `providers` and `agent-runtime` imports pi-ai.
 - No package imports `server`.
 - `workflow` has zero side effects.
 - `cli` imports from `protocol/wire` only. Enforced by lint + CI.
-- `room` receives agents, policies, and context as runtime arguments. It does not import config, context, providers, workflow, storage, or server.
+- `room` receives agent runtimes, policies, and context refs as runtime arguments.
 - Contributors: `protocol/wire` is public API. `protocol/engine` is internal.
 
 ### Package Responsibilities
 
 **@the-hive/protocol** — Types, interfaces, schemas. Two entrypoints: wire (stable) and engine (internal). No logic, no side effects.
 
-**@the-hive/config** — Config loading, validation, defaults. Team/room/provider/policy definitions. Deps: protocol.
+**@the-hive/config** — Config loading, validation, defaults. Team/room/provider/policy definitions. Domain-to-path mappings. Deps: protocol.
 
-**@the-hive/context** — Builds immutable ContextBundles from docs, schemas, manifests. Staleness detection. Deps: protocol.
+**@the-hive/context** — Repo snapshot management, domain-scoped path policies, directory manifests. Provides read-only access surface for agent runtimes. Deps: protocol.
 
-**@the-hive/providers** — Model/provider adapters over pi-ai. Capability matrix (structured output support, tool calling, context limits, cost). Structured-output normalization. Retry and rate-limit handling. Only package that imports pi-ai or provider SDKs. Deps: protocol.
+**@the-hive/providers** — Model/provider registry over pi-ai. Capability matrix (tool calling, context limits, cost). Only package that imports pi-ai provider SDKs. Deps: protocol.
 
-**@the-hive/room** — Room kernel + built-in policy implementations. Turn sequencing, ledger management, room health monitoring, raw turn trace capture, semantic action validation. Receives agents, policies, context as runtime arguments. Deps: protocol.
+**@the-hive/agent-runtime** — Pi-powered agentic loop for deliberation agents. Read-only tools (file read, directory list). Trace capture for every substep. Graceful failure and resume. Wall-clock enforcement. Deps: protocol, providers.
+
+**@the-hive/room** — Room kernel + policy implementations. Turn scheduling, conversation management, convergence detection, room health. Room summary extraction pipeline (turn-local → reducer → coverage validator). Deps: protocol.
 
 **@the-hive/workflow** — Pure state machine reducer. Task lifecycle. Escalation logic. Query-back job emission. Zero side effects, zero persistence. Deps: protocol.
 
-**@the-hive/storage** — SQLite schema, migrations, repositories, ledger store, turn trace store, workflow event log, snapshots. Only package that touches SQLite. Deps: protocol.
+**@the-hive/storage** — SQLite schema, migrations, repositories. Stores: workflow events, room summaries, room transcripts, turn traces, review packets, repo snapshot metadata. Only package that touches SQLite. Deps: protocol.
 
-**@the-hive/server** — Runtime host. Authoritative state writes. Job dispatch (receives jobs from workflow, dispatches to rooms). WebSocket API (protocol/wire messages only). Headless mode. Composition root: wires all packages together. Deps: protocol, workflow, storage, config, providers, room, context.
+**@the-hive/server** — Runtime host. Authoritative state writes. Job dispatch (receives jobs from workflow, dispatches to rooms). WebSocket API (protocol/wire messages only). Headless mode. Composition root: wires all packages together. Deps: all packages.
 
 **@the-hive/cli** — Stateless WebSocket client. Terminal UI. Approve/reject flow. Zero server imports. Deps: protocol/wire.
 
-**test/eval** (non-package) — Golden tasks, single-agent baselines, replay from turn traces, artifact scoring, cost/latency metrics. Evaluation gate: Hive must beat a single-agent role-play baseline on golden tasks at acceptable cost and latency before multi-agent features expand.
+**test/eval** (non-package) — Golden tasks, single-agent baselines, artifact scoring, cost/latency metrics.
 
 ## Evaluation Requirements
 
@@ -323,12 +354,14 @@ The product hypothesis (structured multi-agent deliberation produces better arch
 ### Eval Gate
 
 Before expanding multi-agent features:
-1. Hive must produce measurably better proposals than a single strong agent with the same ContextBundle and role-play prompt.
+1. Hive must produce measurably better proposals than a single strong agent **with the same repo snapshot and tools**.
 2. Cost multiplier no greater than 5x the single-agent baseline.
 3. Latency no greater than 3x the single-agent baseline.
 4. Blinded human scoring on proposal quality.
 5. Holdout tasks (not in the development set).
 6. Hard rule: ties go to the simpler single-agent baseline.
+
+The baseline gets the same repo access and tools as Hive agents. The comparison tests multi-agent deliberation value, not tool access advantage.
 
 If the baseline wins, the architecture needs fundamental reconsideration.
 
@@ -347,12 +380,12 @@ Workflow (pure reducer: command + state -> events + jobs)
   | (emit jobs)
   v
 Room Kernel + Policies
-  | (context bundle in, structured ledger out)
+  | (orchestrate agent turns, manage conversation, detect convergence)
   v
-Agents (sealed: immutable context read + typed actions only)
-  | (LLM calls)
+Agent Runtime (Pi loop: read files, reason, produce contribution)
+  | (read-only repo access via context)
   v
-Providers (model adapters, normalization)
+Providers (model registry, pi-ai adapters)
 ```
 
 ### Deliberation Pipeline
@@ -361,16 +394,19 @@ Providers (model adapters, normalization)
 Task submitted
   |
   v
-Stage 1: Domain rooms (mini agents)
-  |-- Frontend room -> ledger + report.md
-  |-- Backend room  -> ledger + report.md
-  |-- Database room -> ledger + report.md
+Prepare repo snapshot + domain scoping
   |
   v
-Stage 2: Synthesis room (lead models)
-  |-- Reads Stage 1 ledgers
+Stage 1: Domain rooms (mini agents, agentic loops)
+  |-- Frontend room -> transcript + extracted RoomSummary
+  |-- Backend room  -> transcript + extracted RoomSummary
+  |-- Database room -> transcript + extracted RoomSummary
+  |
+  v
+Stage 2: Synthesis room (stronger models, agentic loops)
+  |-- Reads Stage 1 room summaries
   |-- May issue query_room -> bounded mini-cycle -> QueryResponseArtifact
-  |-- Produces synthesis ledger + review packet
+  |-- Produces synthesis summary + review packet
   |
   v
 Human gate
@@ -388,5 +424,5 @@ External:  submitted -> running -> awaiting_review -> approved
                                                    -> cancelled
 
 Internal (within "running"):
-  mini_rooms -> synthesis -> [query_back -> synthesis] -> rendering
+  preparing_snapshot -> mini_rooms -> synthesis -> [query_back -> synthesis] -> rendering
 ```

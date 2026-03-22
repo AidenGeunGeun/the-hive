@@ -20,6 +20,8 @@ bun run check:fix    # Lint + format fix
 bun run typecheck    # TypeScript type checking across all packages
 bun run test         # Run all tests
 bun run test:pkg @the-hive/<name>  # Run tests for a specific package
+bun run smoke        # End-to-end smoke test
+bun run smoke:debug  # Smoke test with debug output
 ```
 
 From a package directory:
@@ -40,7 +42,7 @@ bun test             # Run this package's tests only
 
 ## Testing
 
-- Vitest for all packages.
+- Vitest for all packages (except server and storage which use `bun test` for bun:sqlite compatibility).
 - Run all tests: `bun run test`.
 - Run one package's tests: `bun run test:pkg @the-hive/<name>` (e.g., `bun run test:pkg @the-hive/room`).
 - From a package directory: `bun test`.
@@ -48,7 +50,7 @@ bun test             # Run this package's tests only
 
 ### Evaluation Tests
 
-`test/eval/` contains integration-level evaluation tests: golden tasks, single-agent baselines, replay from turn traces, artifact scoring, cost/latency metrics. These are expensive (real LLM calls, real cost). Do not run these without asking.
+`test/eval/` contains integration-level evaluation tests: golden tasks, single-agent baselines, artifact scoring, cost/latency metrics. These are expensive (real LLM calls, real cost). Do not run these without asking.
 
 ## Architecture — Hard Boundary Rules
 
@@ -57,23 +59,24 @@ These are inviolable. Breaking any of these is a structural defect.
 ### Package Dependency Rules
 
 ```
-protocol    <- (no deps — base package)
-config      <- protocol
-context     <- protocol
-providers   <- protocol (+ pi-ai as external)
-room        <- protocol
-workflow    <- protocol
-storage     <- protocol
-server      <- protocol, workflow, storage, config, providers, room, context
-cli         <- protocol/wire ONLY
+protocol       <- (no deps — base package)
+config         <- protocol
+context        <- protocol
+providers      <- protocol (+ pi-ai as external)
+agent-runtime  <- protocol, providers
+room           <- protocol
+workflow       <- protocol
+storage        <- protocol
+server         <- protocol, workflow, storage, config, providers, agent-runtime, room, context
+cli            <- protocol/wire ONLY
 ```
 
 - **No package imports `server`.** Server is the composition root.
 - **`cli` imports from `protocol/wire` only.** Never `protocol/engine`. Never any other package. Enforced by CI.
-- **`room` receives agents, policies, and context as runtime arguments.** It does not import config, context, providers, workflow, storage, or server.
+- **`room` receives agent runtimes, policies, and context refs as runtime arguments.** It does not import config, context, providers, agent-runtime, workflow, storage, or server.
 - **`workflow` has zero side effects.** Pure function: `apply(command, state) -> { newState, events, jobs }`. No I/O, no persistence, no network.
 - **Only `storage` touches SQLite.** No other package reads or writes to the database.
-- **Only `providers` imports provider SDKs** (including `@mariozechner/pi-ai`).
+- **Only `providers` and `agent-runtime` import pi-ai.**
 - **Only `server` writes to storage.** All other packages emit events or jobs.
 
 ### Protocol Wire vs Engine
@@ -86,17 +89,28 @@ cli         <- protocol/wire ONLY
 ### Persistence Authority
 
 - Workflow event log = authoritative for task state.
-- Ledger store = authoritative for decisions.
-- Turn trace store = audit only. Not consumed during normal operation.
+- Room summaries = authoritative for decisions (extracted from transcripts).
+- Room transcripts = evidence base. Summaries reference them.
+- Turn traces = deep audit (agent loop internals). Not consumed during normal operation.
 - Snapshots = recovery optimization. Derived, not authoritative.
+- Pi session state is NOT authoritative. Treat as cache/optimization only.
 
-### Sealed Agent Boundary
+### Agent Boundary
 
-Agents in deliberation rooms can ONLY:
-- Read their immutable ContextBundle
-- Emit structured turns (typed actions)
+Deliberation agents run as Pi-powered agentic loops with **read-only** repo access:
 
-Agents CANNOT: read files, write files, execute commands, auto-discover extensions, access the network. The Hive does NOT use pi-mono's agent runtime. Only `pi-ai` for provider abstraction.
+Agents CAN:
+- Read files in the repository (scoped to their domain by path policy)
+- List directories
+- Read the conversation transcript
+
+Agents CANNOT:
+- Write or modify files
+- Execute shell commands
+- Access the network
+- Write to storage or any persistent state
+
+The Hive uses `pi-ai` for model API abstraction. The `agent-runtime` package manages the agentic loop with read-only tools. All durable state is owned by the server.
 
 ## Prompts
 
@@ -106,22 +120,23 @@ Agents CANNOT: read files, write files, execute commands, auto-discover extensio
 - `prompts/personas/*.md` — Domain-specific focus areas (frontend, backend, database, etc.).
 - `prompts/team-lead.md` — Synthesis room rules for cross-domain integration.
 
-When modifying prompts: these directly affect agent behavior in rooms. Changes here are design decisions, not code changes. Do not add tool definitions or capability grants — agents are sealed (see Sealed Agent Boundary above).
+When modifying prompts: these directly affect agent behavior in rooms. Changes here are design decisions, not code changes.
 
 ## Git Rules
 
 - Do not commit unless asked.
 - Use `git add <specific-files>` only. Never `git add -A` or `git add .`.
-- Commit message format: `type(scope): description` (e.g., `feat(room): add ledger implementation`).
-- Scopes: `protocol`, `config`, `context`, `providers`, `room`, `workflow`, `storage`, `server`, `cli`, `docs`, `ci`.
+- Commit message format: `type(scope): description` (e.g., `feat(room): add agent runtime`).
+- Scopes: `protocol`, `config`, `context`, `providers`, `agent-runtime`, `room`, `workflow`, `storage`, `server`, `cli`, `docs`, `ci`.
 - Do not force push. Do not use `--no-verify`.
 
 ## Critical Rules
 
 - **Read ARCHITECTURE.md** before making structural changes.
-- **Never add filesystem/shell/network tools to deliberation agents.** This violates the sealed boundary.
+- **Never give agents write/shell/network access.** Read-only repo access only.
 - **Never import `server` from any other package.**
 - **Never import `protocol/engine` from `cli`.**
 - **Never write to SQLite from outside `storage`.**
 - **Never add side effects to `workflow`.** It is a pure reducer.
+- **Never treat Pi session state as authoritative.** Own all durable state in storage.
 - **Always run `bun run check` after code changes.** Fix all errors before committing.
