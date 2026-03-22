@@ -44,7 +44,7 @@ export interface IssueSummaryView {
 	readonly issueId: string;
 	readonly title: string;
 	readonly state: IssueStateView;
-	readonly domain: string;
+	readonly domain?: string;
 }
 
 export interface RiskProposalView {
@@ -62,7 +62,8 @@ export interface ContextGapView {
 
 export interface EvidenceTraceLinkView {
 	readonly issueId: string;
-	readonly sectionRef: string;
+	readonly sectionRef?: string;
+	readonly evidence?: string;
 	readonly excerpt?: string;
 }
 

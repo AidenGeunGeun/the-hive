@@ -11,7 +11,17 @@ import {
 	createTaskId,
 	createTurnId,
 } from "../src/engine/index.ts";
-import { reviewPacketViewSchema, wireCommandSchema, wireEventSchema } from "../src/wire/index.ts";
+import {
+	evidenceTraceLinkViewSchema,
+	issueSummaryViewSchema,
+	reviewPacketViewSchema,
+	taskFailedEventSchema,
+	taskFailureCodeSchema,
+	taskSnapshotEventSchema,
+	wireCommandSchema,
+	wireEventSchema,
+	wireServerMessageSchema,
+} from "../src/wire/index.ts";
 import type { WireCommand } from "../src/wire/index.ts";
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -142,7 +152,23 @@ describe("protocol contracts", () => {
 		expect(wireCommandSchema.type).toBe("union");
 		expect(wireCommandSchema.anyOf).toHaveLength(6);
 		expect(wireEventSchema.type).toBe("union");
-		expect(wireEventSchema.anyOf).toHaveLength(6);
+		expect(wireEventSchema.anyOf).toHaveLength(7);
+		expect(taskFailedEventSchema.properties.errorCode).toEqual(taskFailureCodeSchema);
+		expect(taskSnapshotEventSchema.properties.snapshot).toEqual({
+			type: "object",
+			properties: expect.any(Object),
+		});
+		expect(wireServerMessageSchema.type).toBe("union");
+		expect(wireServerMessageSchema.anyOf).toHaveLength(2);
+		expect(issueSummaryViewSchema.properties.domain).toEqual({ type: "string", optional: true });
+		expect(evidenceTraceLinkViewSchema.properties.sectionRef).toEqual({
+			type: "string",
+			optional: true,
+		});
+		expect(evidenceTraceLinkViewSchema.properties.evidence).toEqual({
+			type: "string",
+			optional: true,
+		});
 		expect(reviewPacketViewSchema.properties.proposalMarkdown).toEqual({ type: "string" });
 	});
 });

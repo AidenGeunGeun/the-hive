@@ -6,23 +6,37 @@ import { describe, expect, it } from "bun:test";
 
 import {
 	type LedgerEntryRecord,
+	type PersistableWorkflowEvent,
 	type QueryResponseArtifactRecord,
+	type ReviewPacketRecord,
+	type RoomArtifactRecord,
+	type TaskIndexRecord,
 	type TurnTraceRecord,
 	type WorkflowEventRecord,
 	type WorkflowSnapshotRecord,
 	appendLedgerEntries,
 	appendQueryResponseArtifact,
+	appendRoomArtifact,
 	appendTurnTrace,
 	appendWorkflowEvents,
+	appendWorkflowEventsAutoSeq,
 	closeDatabase,
+	listRecoverableTasks,
 	openDatabase,
+	readLatestReviewPacket,
 	readLatestSnapshot,
 	readLedgerEntries,
 	readQueryResponseArtifacts,
+	readReviewPacket,
+	readRoomArtifact,
+	readTaskIndex,
 	readTurnTraces,
 	readWorkflowEvents,
 	runMigrations,
+	upsertTaskIndex,
 	withTransaction,
+	withWriteTransaction,
+	writeReviewPacket,
 	writeSnapshot,
 } from "../src/index";
 
@@ -63,6 +77,21 @@ function createWorkflowEventRecords(taskId: string): readonly WorkflowEventRecor
 			eventType: "task_review_ready",
 			payloadJson: JSON.stringify({ version: 1 }),
 			createdAtMs: 160,
+		},
+	];
+}
+
+function createPersistableWorkflowEvents(): readonly PersistableWorkflowEvent[] {
+	return [
+		{
+			eventType: "task_submitted",
+			payloadJson: JSON.stringify({ prompt: "Design the system" }),
+			createdAtMs: 100,
+		},
+		{
+			eventType: "task_started",
+			payloadJson: JSON.stringify({}),
+			createdAtMs: 110,
 		},
 	];
 }
@@ -150,6 +179,45 @@ function createQueryArtifact(): QueryResponseArtifactRecord {
 	};
 }
 
+function createRoomArtifact(roomId: string): RoomArtifactRecord {
+	return {
+		roomId,
+		artifactKind: "report_markdown",
+		content: "# Domain report",
+		pathHint: "reports/domain.md",
+		createdAtMs: 500,
+	};
+}
+
+function createReviewPacket(
+	taskId: string,
+	version: number,
+	createdAtMs: number,
+): ReviewPacketRecord {
+	return {
+		taskId,
+		version,
+		packetJson: JSON.stringify({ version, proposalMarkdown: `proposal-${version}` }),
+		createdAtMs,
+	};
+}
+
+function createTaskIndex(
+	taskId: string,
+	externalState: string,
+	updatedAtMs: number,
+): TaskIndexRecord {
+	return {
+		taskId,
+		externalState,
+		internalPhase: externalState === "awaiting_review" ? "awaiting_review" : "mini_rooms",
+		prompt: `Prompt for ${taskId}`,
+		latestEventSeq: updatedAtMs / 10,
+		createdAtMs: 100,
+		updatedAtMs,
+	};
+}
+
 describe("storage", () => {
 	it("runs migrations on a fresh database and creates all tables and views", () => {
 		const { dir, path } = createTempDatabasePath();
@@ -159,23 +227,24 @@ describe("storage", () => {
 			runMigrations(db);
 
 			const objects = db
-				.query<{ readonly name: string; readonly type: string }, []>(
-					"SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')",
-				)
-				.all();
+				.query("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')")
+				.all() as { readonly name: string; readonly type: string }[];
 			const names = objects.map((row) => row.name).sort();
 
 			expect(names).toEqual(
 				expect.arrayContaining([
+					"context_gaps_v",
 					"current_issue_state_v",
 					"ledger_entries",
 					"open_issues_v",
 					"query_response_artifacts",
+					"review_packets",
 					"risk_proposals_v",
+					"room_artifacts",
+					"tasks",
 					"turn_traces",
 					"workflow_events",
 					"workflow_snapshots",
-					"context_gaps_v",
 				]),
 			);
 		} finally {
@@ -199,6 +268,35 @@ describe("storage", () => {
 
 			expect(readWorkflowEvents(db, "task-1").map((record) => record.seq)).toEqual([1, 2, 6]);
 			expect(readWorkflowEvents(db, "task-1", 2).map((record) => record.seq)).toEqual([6]);
+		} finally {
+			closeDatabase(db);
+			rmSync(dir, { force: true, recursive: true });
+		}
+	});
+
+	it("assigns workflow event seq values automatically inside write transactions", () => {
+		const { dir, path } = createTempDatabasePath();
+		const db = openDatabase(path);
+
+		try {
+			runMigrations(db);
+
+			const firstBatch = withWriteTransaction(db, () =>
+				appendWorkflowEventsAutoSeq(db, "task-1", createPersistableWorkflowEvents()),
+			);
+			const secondBatch = withWriteTransaction(db, () =>
+				appendWorkflowEventsAutoSeq(db, "task-1", [
+					{
+						eventType: "task_review_ready",
+						payloadJson: JSON.stringify({ version: 1 }),
+						createdAtMs: 120,
+					},
+				]),
+			);
+
+			expect(firstBatch.map((record) => record.seq)).toEqual([1, 2]);
+			expect(secondBatch.map((record) => record.seq)).toEqual([3]);
+			expect(readWorkflowEvents(db, "task-1").map((record) => record.seq)).toEqual([1, 2, 3]);
 		} finally {
 			closeDatabase(db);
 			rmSync(dir, { force: true, recursive: true });
@@ -254,6 +352,73 @@ describe("storage", () => {
 		}
 	});
 
+	it("round-trips room artifacts and returns null for missing rooms", () => {
+		const { dir, path } = createTempDatabasePath();
+		const db = openDatabase(path);
+
+		try {
+			runMigrations(db);
+			const artifact = createRoomArtifact("room-artifact");
+			appendRoomArtifact(db, artifact);
+
+			expect(readRoomArtifact(db, artifact.roomId)).toEqual(artifact);
+			expect(readRoomArtifact(db, "missing-room")).toBeNull();
+		} finally {
+			closeDatabase(db);
+			rmSync(dir, { force: true, recursive: true });
+		}
+	});
+
+	it("writes review packets, reads specific versions, and returns the latest version", () => {
+		const { dir, path } = createTempDatabasePath();
+		const db = openDatabase(path);
+
+		try {
+			runMigrations(db);
+			const firstPacket = createReviewPacket("task-1", 1, 600);
+			const secondPacket = createReviewPacket("task-1", 2, 700);
+			writeReviewPacket(db, firstPacket);
+			writeReviewPacket(db, secondPacket);
+
+			expect(readReviewPacket(db, "task-1", 1)).toEqual(firstPacket);
+			expect(readReviewPacket(db, "task-1", 3)).toBeNull();
+			expect(readLatestReviewPacket(db, "task-1")).toEqual(secondPacket);
+		} finally {
+			closeDatabase(db);
+			rmSync(dir, { force: true, recursive: true });
+		}
+	});
+
+	it("upserts task index records and lists only recoverable tasks", () => {
+		const { dir, path } = createTempDatabasePath();
+		const db = openDatabase(path);
+
+		try {
+			runMigrations(db);
+			const runningTask = createTaskIndex("task-running", "running", 200);
+			const updatedRunningTask = {
+				...runningTask,
+				internalPhase: "awaiting_review",
+				externalState: "awaiting_review",
+				latestEventSeq: 42,
+				updatedAtMs: 300,
+			};
+			const approvedTask = createTaskIndex("task-approved", "approved", 250);
+			const rejectedTask = createTaskIndex("task-rejected", "rejected", 260);
+
+			upsertTaskIndex(db, runningTask);
+			upsertTaskIndex(db, approvedTask);
+			upsertTaskIndex(db, rejectedTask);
+			upsertTaskIndex(db, updatedRunningTask);
+
+			expect(readTaskIndex(db, "task-running")).toEqual(updatedRunningTask);
+			expect(listRecoverableTasks(db)).toEqual([rejectedTask, updatedRunningTask]);
+		} finally {
+			closeDatabase(db);
+			rmSync(dir, { force: true, recursive: true });
+		}
+	});
+
 	it("rolls back all writes when a transaction throws", () => {
 		const { dir, path } = createTempDatabasePath();
 		const db = openDatabase(path);
@@ -266,12 +431,14 @@ describe("storage", () => {
 				withTransaction(db, () => {
 					appendLedgerEntries(db, roomId, createLedgerEntryRecords(roomId));
 					appendTurnTrace(db, roomId, createTurnTrace(roomId));
+					appendWorkflowEventsAutoSeq(db, "task-atomic", createPersistableWorkflowEvents());
 					throw new TestTransactionError();
 				}),
 			).toThrow(TestTransactionError);
 
 			expect(readLedgerEntries(db, roomId)).toEqual([]);
 			expect(readTurnTraces(db, roomId)).toEqual([]);
+			expect(readWorkflowEvents(db, "task-atomic")).toEqual([]);
 		} finally {
 			closeDatabase(db);
 			rmSync(dir, { force: true, recursive: true });
@@ -288,30 +455,23 @@ describe("storage", () => {
 			appendLedgerEntries(db, roomId, createLedgerEntryRecords(roomId));
 
 			const currentIssueState = db
-				.query<
-					{
-						readonly room_id: string;
-						readonly issue_id: string;
-						readonly current_state: string;
-					},
-					[]
-				>("SELECT room_id, issue_id, current_state FROM current_issue_state_v WHERE room_id = ?1")
-				.get(roomId);
+				.query(
+					"SELECT room_id, issue_id, current_state FROM current_issue_state_v WHERE room_id = ?1",
+				)
+				.get(roomId) as {
+				readonly room_id: string;
+				readonly issue_id: string;
+				readonly current_state: string;
+			};
 			const riskProposals = db
-				.query<{ readonly issue_id: string }, []>(
-					"SELECT issue_id FROM risk_proposals_v WHERE room_id = ?1",
-				)
-				.all(roomId);
+				.query("SELECT issue_id FROM risk_proposals_v WHERE room_id = ?1")
+				.all(roomId) as { readonly issue_id: string }[];
 			const openIssues = db
-				.query<{ readonly issue_id: string }, []>(
-					"SELECT issue_id FROM open_issues_v WHERE room_id = ?1",
-				)
-				.all(roomId);
+				.query("SELECT issue_id FROM open_issues_v WHERE room_id = ?1")
+				.all(roomId) as { readonly issue_id: string }[];
 			const contextGaps = db
-				.query<{ readonly description: string }, []>(
-					"SELECT description FROM context_gaps_v WHERE room_id = ?1",
-				)
-				.all(roomId);
+				.query("SELECT description FROM context_gaps_v WHERE room_id = ?1")
+				.all(roomId) as { readonly description: string }[];
 
 			expect(currentIssueState).toEqual({
 				room_id: roomId,

@@ -1,6 +1,6 @@
-import type { WireErrorCode } from "./errors";
+import type { TaskFailureCode } from "./errors";
 import type { ProtocolVersion } from "./version";
-import type { ExternalTaskState, ReviewPacketView, RoomKindView } from "./views";
+import type { ExternalTaskState, ReviewPacketView, RoomKindView, TaskSnapshotView } from "./views";
 
 export interface TaskStateChangedEvent {
 	readonly kind: "task_state_changed";
@@ -24,6 +24,7 @@ export interface RoomCompletedEvent {
 	readonly taskId: string;
 	readonly roomId: string;
 	readonly roomKind: RoomKindView;
+	readonly outcome: "completed" | "inconclusive";
 	readonly completedAtMs: number;
 }
 
@@ -37,7 +38,7 @@ export interface TaskReviewReadyEvent {
 export interface TaskFailedEvent {
 	readonly kind: "task_failed";
 	readonly taskId: string;
-	readonly errorCode: WireErrorCode;
+	readonly errorCode: TaskFailureCode;
 	readonly message: string;
 	readonly failedAtMs: number;
 }
@@ -48,13 +49,21 @@ export interface TaskCancelledEvent {
 	readonly cancelledAtMs: number;
 }
 
+export interface TaskSnapshotEvent {
+	readonly kind: "task_snapshot";
+	readonly commandId: string;
+	readonly snapshot: TaskSnapshotView;
+	readonly sentAtMs: number;
+}
+
 export type WireEvent =
 	| TaskStateChangedEvent
 	| RoomStartedEvent
 	| RoomCompletedEvent
 	| TaskReviewReadyEvent
 	| TaskFailedEvent
-	| TaskCancelledEvent;
+	| TaskCancelledEvent
+	| TaskSnapshotEvent;
 
 export interface WireEventEnvelope {
 	readonly protocolVersion: ProtocolVersion;

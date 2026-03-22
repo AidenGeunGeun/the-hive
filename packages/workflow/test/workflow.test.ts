@@ -1,12 +1,11 @@
 import {
 	type RoomKind,
-	type RoomRunResult,
+	type WorkflowPlan,
 	type WorkflowState,
 	createAgentId,
 	createIssueId,
 	createRoomId,
 	createTaskId,
-	createTurnId,
 } from "@the-hive/protocol/engine";
 import { describe, expect, it } from "vitest";
 
@@ -19,7 +18,22 @@ import {
 	projectState,
 } from "../src/index";
 
-function createSubmitTaskCommand(taskId = createTaskId()): WorkflowCommand {
+const DEFAULT_PLAN: WorkflowPlan = {
+	includeSynthesis: true,
+	allowQueryBack: true,
+	allowRerun: true,
+};
+
+const NO_SYNTHESIS_PLAN: WorkflowPlan = {
+	includeSynthesis: false,
+	allowQueryBack: true,
+	allowRerun: true,
+};
+
+function createSubmitTaskCommand(
+	taskId = createTaskId(),
+	plan: WorkflowPlan = DEFAULT_PLAN,
+): WorkflowCommand {
 	return {
 		kind: "submit_task",
 		commandId: `submit:${taskId}`,
@@ -28,6 +42,7 @@ function createSubmitTaskCommand(taskId = createTaskId()): WorkflowCommand {
 		bundleInputPath: "/tmp/context.json",
 		requestedDomains: ["frontend", "backend"],
 		configProfile: "default",
+		plan,
 		submittedAtMs: 100,
 	};
 }
@@ -35,6 +50,7 @@ function createSubmitTaskCommand(taskId = createTaskId()): WorkflowCommand {
 function createTaskSubmittedEvent(
 	taskId: ReturnType<typeof createTaskId>,
 	maxIterations = 2,
+	plan: WorkflowPlan = DEFAULT_PLAN,
 ): WorkflowEvent {
 	return {
 		kind: "task_submitted",
@@ -45,53 +61,35 @@ function createTaskSubmittedEvent(
 		bundleInputPath: "/tmp/context.json",
 		requestedDomains: ["frontend", "backend"],
 		configProfile: "default",
+		plan,
 		maxIterations,
 	};
 }
 
-function createDomainRoomResult(
+function createRoomCompletedCommand(
+	taskId: ReturnType<typeof createTaskId>,
 	roomId: ReturnType<typeof createRoomId>,
-	completedAtMs: number,
-	kind: RoomKind = "domain",
-): RoomRunResult {
+	timestamp: number,
+	roomKind: RoomKind = "domain",
+	outcome: "completed" | "inconclusive" | "failed" = "completed",
+): WorkflowCommand {
 	return {
+		kind: "room_completed",
+		commandId: `room-complete:${roomKind}:${timestamp}:${taskId}`,
+		taskId,
+		timestamp,
 		roomId,
-		kind,
-		outcome: "completed",
-		ledgerEntries: [
-			{
-				seq: 1,
-				turnId: createTurnId(),
-				agentId: createAgentId(),
-				action: {
-					kind: "create_issue",
-					issueId: createIssueId(),
-					title: `${kind} issue`,
-					description: "Issue description",
-				},
-				timestamp: completedAtMs,
-			},
-		],
-		turnTraces: [],
-		renderedArtifact: {
-			kind:
-				kind === "synthesis"
-					? "review_packet_markdown"
-					: kind === "query_back"
-						? "query_response_markdown"
-						: "report_markdown",
-			content: `artifact:${roomId}`,
-		},
-		health: {
-			totalAgents: 3,
-			activeAgents: 3,
-			failedAgents: 0,
-			minHealthyAgents: 2,
-			isHealthy: true,
-		},
-		startedAtMs: completedAtMs - 5,
-		completedAtMs,
+		roomKind,
+		outcome,
 	};
+}
+
+function getRoomId(job: WorkflowState["pendingJobs"][number]): ReturnType<typeof createRoomId> {
+	return (job.payload as { readonly roomId: ReturnType<typeof createRoomId> }).roomId;
+}
+
+function getDomain(job: WorkflowState["pendingJobs"][number]): string {
+	return (job.payload as { readonly domain: string }).domain;
 }
 
 function applyCommands(
@@ -113,10 +111,10 @@ function applyCommands(
 	};
 }
 
-function buildMiniRoomState() {
+function buildMiniRoomState(plan: WorkflowPlan = DEFAULT_PLAN) {
 	const taskId = createTaskId();
 	const initialState = buildInitialState(taskId, 2);
-	const submitCommand = createSubmitTaskCommand(taskId);
+	const submitCommand = createSubmitTaskCommand(taskId, plan);
 	const submitted = applyCommand(initialState, submitCommand);
 	const contextBuilt = applyCommand(submitted.newState, {
 		kind: "context_bundle_built",
@@ -136,26 +134,17 @@ function buildMiniRoomState() {
 function buildSynthesisState() {
 	const { taskId, state, jobs } = buildMiniRoomState();
 	const [firstRoomJob, secondRoomJob] = jobs;
-	const firstDomainRoomId = (firstRoomJob?.payload as { readonly roomId: string }).roomId;
-	const secondDomainRoomId = (secondRoomJob?.payload as { readonly roomId: string }).roomId;
+	const firstDomainRoomId = getRoomId(firstRoomJob as WorkflowState["pendingJobs"][number]);
+	const secondDomainRoomId = getRoomId(secondRoomJob as WorkflowState["pendingJobs"][number]);
 
-	const afterFirstRoom = applyCommand(state, {
-		kind: "room_completed",
-		commandId: `room-complete:1:${taskId}`,
-		taskId,
-		timestamp: 120,
-		roomId: firstDomainRoomId as ReturnType<typeof createRoomId>,
-		result: createDomainRoomResult(firstDomainRoomId as ReturnType<typeof createRoomId>, 120),
-	});
-
-	const afterSecondRoom = applyCommand(afterFirstRoom.newState, {
-		kind: "room_completed",
-		commandId: `room-complete:2:${taskId}`,
-		taskId,
-		timestamp: 130,
-		roomId: secondDomainRoomId as ReturnType<typeof createRoomId>,
-		result: createDomainRoomResult(secondDomainRoomId as ReturnType<typeof createRoomId>, 130),
-	});
+	const afterFirstRoom = applyCommand(
+		state,
+		createRoomCompletedCommand(taskId, firstDomainRoomId, 120),
+	);
+	const afterSecondRoom = applyCommand(
+		afterFirstRoom.newState,
+		createRoomCompletedCommand(taskId, secondDomainRoomId, 130),
+	);
 
 	return {
 		taskId,
@@ -166,19 +155,11 @@ function buildSynthesisState() {
 
 function buildAwaitingReviewState(maxIterations = 2) {
 	const { taskId, state, jobs } = buildSynthesisState();
-	const synthesisRoomId = (jobs[0]?.payload as { readonly roomId: string }).roomId;
-	const afterSynthesis = applyCommand(state, {
-		kind: "room_completed",
-		commandId: `synthesis-complete:${taskId}`,
-		taskId,
-		timestamp: 140,
-		roomId: synthesisRoomId as ReturnType<typeof createRoomId>,
-		result: createDomainRoomResult(
-			synthesisRoomId as ReturnType<typeof createRoomId>,
-			140,
-			"synthesis",
-		),
-	});
+	const synthesisRoomId = getRoomId(jobs[0] as WorkflowState["pendingJobs"][number]);
+	const afterSynthesis = applyCommand(
+		state,
+		createRoomCompletedCommand(taskId, synthesisRoomId, 140, "synthesis"),
+	);
 
 	const rendered = applyCommand(
 		{
@@ -201,7 +182,7 @@ function buildAwaitingReviewState(maxIterations = 2) {
 }
 
 describe("workflow reducer", () => {
-	it("submits a task and enqueues the context bundle job", () => {
+	it("submits a task, records public submission, and enqueues the context bundle job", () => {
 		const taskId = createTaskId();
 		const state = buildInitialState(taskId, 2);
 		const transition = applyCommand(state, createSubmitTaskCommand(taskId));
@@ -221,6 +202,13 @@ describe("workflow reducer", () => {
 				requestedDomains: ["frontend", "backend"],
 				configProfile: "default",
 			},
+		});
+		expect(transition.newState.submission).toEqual({
+			prompt: "Design the architecture",
+			bundleInputPath: "/tmp/context.json",
+			requestedDomains: ["frontend", "backend"],
+			configProfile: "default",
+			plan: DEFAULT_PLAN,
 		});
 		expect(transition.newState.externalState).toBe("running");
 		expect(transition.newState.internalPhase).toBe("building_context");
@@ -285,6 +273,7 @@ describe("workflow reducer", () => {
 			prompt: "Design the architecture",
 			bundleInputPath: "/tmp/context.json",
 			requestedDomains: ["frontend", "frontend", "backend"],
+			plan: DEFAULT_PLAN,
 			submittedAtMs: 100,
 		}).newState;
 
@@ -298,42 +287,83 @@ describe("workflow reducer", () => {
 
 		expect(transition.jobs).toHaveLength(2);
 		expect(transition.newState.pendingJobs).toHaveLength(2);
-		expect(
-			new Set(transition.jobs.map((job) => (job.payload as { readonly domain: string }).domain)),
-		).toEqual(new Set(["frontend", "backend"]));
+		expect(new Set(transition.jobs.map((job) => getDomain(job)))).toEqual(
+			new Set(["frontend", "backend"]),
+		);
+	});
+
+	it("starts a room when a pending room job exists", () => {
+		const { taskId, state, jobs } = buildMiniRoomState();
+		const roomJob = jobs[0] as WorkflowState["pendingJobs"][number];
+		const roomId = getRoomId(roomJob);
+		const domain = getDomain(roomJob);
+		const agentIds = [createAgentId(), createAgentId()];
+
+		const transition = applyCommand(state, {
+			kind: "start_room",
+			commandId: `room-start:${taskId}`,
+			taskId,
+			timestamp: 115,
+			roomId,
+			roomKind: "domain",
+			domain,
+			agentIds,
+		});
+
+		expect(transition.events).toEqual([
+			{
+				kind: "room_started",
+				commandId: `room-start:${taskId}`,
+				taskId,
+				timestamp: 115,
+				roomId,
+				roomKind: "domain",
+				domain,
+				agentIds,
+			},
+		]);
+		expect(transition.jobs).toEqual([]);
+		expect(transition.newState.pendingJobs).toEqual(state.pendingJobs);
+		expect(transition.newState.updatedAtMs).toBe(115);
+	});
+
+	it("requires a pending room job before start_room can emit room_started", () => {
+		const { taskId, state } = buildMiniRoomState();
+
+		expect(() =>
+			applyCommand(state, {
+				kind: "start_room",
+				commandId: `missing-room:${taskId}`,
+				taskId,
+				timestamp: 115,
+				roomId: createRoomId(),
+				roomKind: "domain",
+				agentIds: [createAgentId()],
+			}),
+		).toThrow(/pending room job/);
 	});
 
 	it("tracks domain room completion and starts synthesis after the last domain room", () => {
 		const { taskId, state, jobs } = buildMiniRoomState();
 		const [firstRoomJob, secondRoomJob] = jobs;
-		const firstRoomId = (firstRoomJob?.payload as { readonly roomId: string }).roomId;
-		const secondRoomId = (secondRoomJob?.payload as { readonly roomId: string }).roomId;
+		const firstRoomId = getRoomId(firstRoomJob as WorkflowState["pendingJobs"][number]);
+		const secondRoomId = getRoomId(secondRoomJob as WorkflowState["pendingJobs"][number]);
 
-		const firstTransition = applyCommand(state, {
-			kind: "room_completed",
-			commandId: `domain-1:${taskId}`,
-			taskId,
-			timestamp: 120,
-			roomId: firstRoomId as ReturnType<typeof createRoomId>,
-			result: createDomainRoomResult(firstRoomId as ReturnType<typeof createRoomId>, 120),
-		});
+		const firstTransition = applyCommand(
+			state,
+			createRoomCompletedCommand(taskId, firstRoomId, 120),
+		);
 
 		expect(firstTransition.events.map((event) => event.kind)).toEqual(["room_completed"]);
 		expect(firstTransition.jobs).toHaveLength(0);
-		expect(firstTransition.newState.completedRoomIds).toContain(
-			firstRoomId as ReturnType<typeof createRoomId>,
-		);
+		expect(firstTransition.newState.completedRoomIds).toContain(firstRoomId);
 		expect(firstTransition.newState.pendingJobs).toHaveLength(1);
 		expect(firstTransition.newState.internalPhase).toBe("mini_rooms");
 
-		const secondTransition = applyCommand(firstTransition.newState, {
-			kind: "room_completed",
-			commandId: `domain-2:${taskId}`,
-			taskId,
-			timestamp: 130,
-			roomId: secondRoomId as ReturnType<typeof createRoomId>,
-			result: createDomainRoomResult(secondRoomId as ReturnType<typeof createRoomId>, 130),
-		});
+		const secondTransition = applyCommand(
+			firstTransition.newState,
+			createRoomCompletedCommand(taskId, secondRoomId, 130),
+		);
 
 		expect(secondTransition.events.map((event) => event.kind)).toEqual([
 			"room_completed",
@@ -341,25 +371,48 @@ describe("workflow reducer", () => {
 		]);
 		expect(secondTransition.jobs).toHaveLength(1);
 		expect(secondTransition.jobs[0]?.kind).toBe("run_synthesis_room");
+		expect(secondTransition.jobs[0]?.payload).toEqual({
+			roomId: expect.any(String),
+			iteration: 0,
+			sourceRoomIds: [firstRoomId, secondRoomId],
+		});
 		expect(secondTransition.newState.internalPhase).toBe("synthesis");
+	});
+
+	it("skips synthesis when the submission plan disables it", () => {
+		const { taskId, state, jobs } = buildMiniRoomState(NO_SYNTHESIS_PLAN);
+		const [firstRoomJob, secondRoomJob] = jobs;
+		const firstRoomId = getRoomId(firstRoomJob as WorkflowState["pendingJobs"][number]);
+		const secondRoomId = getRoomId(secondRoomJob as WorkflowState["pendingJobs"][number]);
+
+		const firstTransition = applyCommand(
+			state,
+			createRoomCompletedCommand(taskId, firstRoomId, 120),
+		);
+		const secondTransition = applyCommand(
+			firstTransition.newState,
+			createRoomCompletedCommand(taskId, secondRoomId, 130),
+		);
+
+		expect(secondTransition.jobs).toHaveLength(1);
+		expect(secondTransition.jobs[0]?.kind).toBe("render_review_packet");
+		expect(secondTransition.jobs[0]?.payload).toEqual({
+			version: 1,
+			iteration: 0,
+			sourceRoomIds: [firstRoomId, secondRoomId],
+			sourceStage: "domain",
+		});
+		expect(secondTransition.newState.internalPhase).toBe("rendering");
 	});
 
 	it("completes synthesis and enqueues review packet rendering", () => {
 		const { taskId, state, jobs } = buildSynthesisState();
-		const synthesisRoomId = (jobs[0]?.payload as { readonly roomId: string }).roomId;
+		const synthesisRoomId = getRoomId(jobs[0] as WorkflowState["pendingJobs"][number]);
 
-		const transition = applyCommand(state, {
-			kind: "room_completed",
-			commandId: `synthesis:${taskId}`,
-			taskId,
-			timestamp: 140,
-			roomId: synthesisRoomId as ReturnType<typeof createRoomId>,
-			result: createDomainRoomResult(
-				synthesisRoomId as ReturnType<typeof createRoomId>,
-				140,
-				"synthesis",
-			),
-		});
+		const transition = applyCommand(
+			state,
+			createRoomCompletedCommand(taskId, synthesisRoomId, 140, "synthesis"),
+		);
 
 		expect(transition.events.map((event) => event.kind)).toEqual([
 			"room_completed",
@@ -367,12 +420,18 @@ describe("workflow reducer", () => {
 		]);
 		expect(transition.jobs).toHaveLength(1);
 		expect(transition.jobs[0]?.kind).toBe("render_review_packet");
+		expect(transition.jobs[0]?.payload).toEqual({
+			version: 1,
+			iteration: 0,
+			sourceRoomIds: [synthesisRoomId],
+			sourceStage: "synthesis",
+		});
 		expect(transition.newState.internalPhase).toBe("rendering");
 	});
 
 	it("transitions synthesis to query_back and returns to synthesis after artifact recording", () => {
 		const { taskId, state, jobs } = buildSynthesisState();
-		const synthesisRoomId = (jobs[0]?.payload as { readonly roomId: string }).roomId;
+		const synthesisRoomId = getRoomId(jobs[0] as WorkflowState["pendingJobs"][number]);
 		const [targetRoomId] = state.completedRoomIds;
 
 		const queryTransition = applyCommand(state, {
@@ -380,7 +439,7 @@ describe("workflow reducer", () => {
 			commandId: `query:${taskId}`,
 			taskId,
 			timestamp: 135,
-			synthesisRoomId: synthesisRoomId as ReturnType<typeof createRoomId>,
+			synthesisRoomId,
 			targetRoomId: targetRoomId as ReturnType<typeof createRoomId>,
 			question: "What contract should the backend expose?",
 			relevantIssueIds: [createIssueId()],
@@ -393,19 +452,12 @@ describe("workflow reducer", () => {
 		expect(queryTransition.jobs).toHaveLength(1);
 		expect(queryTransition.jobs[0]?.kind).toBe("run_query_back_room");
 		expect(queryTransition.newState.internalPhase).toBe("query_back");
+
 		expect(() =>
-			applyCommand(queryTransition.newState, {
-				kind: "room_completed",
-				commandId: `paused-synthesis-complete:${taskId}`,
-				taskId,
-				timestamp: 135,
-				roomId: synthesisRoomId as ReturnType<typeof createRoomId>,
-				result: createDomainRoomResult(
-					synthesisRoomId as ReturnType<typeof createRoomId>,
-					135,
-					"synthesis",
-				),
-			}),
+			applyCommand(
+				queryTransition.newState,
+				createRoomCompletedCommand(taskId, synthesisRoomId, 135, "synthesis"),
+			),
 		).toThrow(/internalPhase synthesis/);
 		expect(() =>
 			applyCommand(queryTransition.newState, {
@@ -413,31 +465,21 @@ describe("workflow reducer", () => {
 				commandId: `paused-synthesis-failed:${taskId}`,
 				taskId,
 				timestamp: 135,
-				roomId: synthesisRoomId as ReturnType<typeof createRoomId>,
+				roomId: synthesisRoomId,
 				errorCode: "synthesis_room_failed",
 				message: "Paused synthesis should not fail here",
 			}),
 		).toThrow(/internalPhase synthesis/);
 
-		const queryRoomId = (queryTransition.jobs[0]?.payload as { readonly roomId: string }).roomId;
-		const completedTransition = applyCommand(queryTransition.newState, {
-			kind: "room_completed",
-			commandId: `query-room-complete:${taskId}`,
-			taskId,
-			timestamp: 136,
-			roomId: queryRoomId as ReturnType<typeof createRoomId>,
-			result: createDomainRoomResult(
-				queryRoomId as ReturnType<typeof createRoomId>,
-				136,
-				"query_back",
-			),
-		});
+		const queryRoomId = getRoomId(queryTransition.jobs[0] as WorkflowState["pendingJobs"][number]);
+		const completedTransition = applyCommand(
+			queryTransition.newState,
+			createRoomCompletedCommand(taskId, queryRoomId, 136, "query_back"),
+		);
 
 		expect(completedTransition.jobs).toHaveLength(0);
 		expect(completedTransition.newState.internalPhase).toBe("query_back");
-		expect(completedTransition.newState.completedRoomIds).not.toContain(
-			queryRoomId as ReturnType<typeof createRoomId>,
-		);
+		expect(completedTransition.newState.completedRoomIds).not.toContain(queryRoomId);
 
 		const responseTransition = applyCommand(completedTransition.newState, {
 			kind: "query_response_recorded",
@@ -460,28 +502,49 @@ describe("workflow reducer", () => {
 			commandId: `query-2:${taskId}`,
 			taskId,
 			timestamp: 138,
-			synthesisRoomId: synthesisRoomId as ReturnType<typeof createRoomId>,
+			synthesisRoomId,
 			targetRoomId: targetRoomId as ReturnType<typeof createRoomId>,
 			question: "One more clarification?",
 			relevantIssueIds: [createIssueId()],
 		});
 
-		const secondQueryRoomId = (
-			secondQueryTransition.jobs[0]?.payload as { readonly roomId: string }
-		).roomId;
+		const secondQueryRoomId = getRoomId(
+			secondQueryTransition.jobs[0] as WorkflowState["pendingJobs"][number],
+		);
 		expect(secondQueryRoomId).not.toBe(queryRoomId);
+	});
+
+	it("accepts inconclusive room completions", () => {
+		const { taskId, state, jobs } = buildMiniRoomState();
+		const roomId = getRoomId(jobs[0] as WorkflowState["pendingJobs"][number]);
+
+		const transition = applyCommand(
+			state,
+			createRoomCompletedCommand(taskId, roomId, 120, "domain", "inconclusive"),
+		);
+
+		expect(transition.events).toContainEqual({
+			kind: "room_completed",
+			commandId: `room-complete:domain:120:${taskId}`,
+			taskId,
+			timestamp: 120,
+			roomId,
+			roomKind: "domain",
+			outcome: "inconclusive",
+		});
+		expect(transition.newState.completedRoomIds).toContain(roomId);
 	});
 
 	it("fails the task when a room fails critically", () => {
 		const { taskId, state, jobs } = buildMiniRoomState();
-		const failedRoomId = (jobs[0]?.payload as { readonly roomId: string }).roomId;
+		const failedRoomId = getRoomId(jobs[0] as WorkflowState["pendingJobs"][number]);
 
 		const transition = applyCommand(state, {
 			kind: "room_failed",
 			commandId: `room-failed:${taskId}`,
 			taskId,
 			timestamp: 125,
-			roomId: failedRoomId as ReturnType<typeof createRoomId>,
+			roomId: failedRoomId,
 			errorCode: "domain_room_failed",
 			message: "Room dropped below quorum",
 		});
@@ -516,15 +579,16 @@ describe("workflow reducer", () => {
 		expect(transition.newState.externalState).toBe("approved");
 	});
 
-	it("rejects a task below the iteration cap and starts a rerun", () => {
+	it("rejects a task below the iteration cap and round-trips structured feedback into rerun jobs", () => {
 		const { taskId, state } = buildAwaitingReviewState(2);
+		const feedback = ["Address the unresolved API mismatch", "Clarify caching ownership"];
 
 		const transition = applyCommand(state, {
 			kind: "reject_task",
 			commandId: `reject:${taskId}`,
 			taskId,
 			timestamp: 160,
-			feedback: "Address the unresolved API mismatch",
+			feedback,
 		});
 
 		expect(transition.events.map((event) => event.kind)).toEqual([
@@ -532,8 +596,17 @@ describe("workflow reducer", () => {
 			"task_started",
 			"room_job_enqueued",
 		]);
+		expect(transition.events[0]).toMatchObject({
+			kind: "task_rejected",
+			feedback,
+		});
 		expect(transition.jobs).toHaveLength(1);
-		expect(transition.jobs[0]?.kind).toBe("build_context_bundle");
+		expect(transition.jobs[0]).toMatchObject({
+			kind: "build_context_bundle",
+			payload: {
+				feedback,
+			},
+		});
 		expect(transition.newState.iteration).toBe(1);
 		expect(transition.newState.externalState).toBe("running");
 		expect(transition.newState.internalPhase).toBe("building_context");
@@ -551,7 +624,7 @@ describe("workflow reducer", () => {
 			commandId: `reject-limit:${taskId}`,
 			taskId,
 			timestamp: 160,
-			feedback: "Still not ready",
+			feedback: ["Still not ready"],
 		});
 
 		expect(transition.events.map((event) => event.kind)).toEqual(["task_rejected", "task_failed"]);
@@ -637,35 +710,35 @@ describe("workflow reducer", () => {
 		).toThrow(/pending/);
 
 		const { state, jobs } = buildMiniRoomState();
-		const domainRoomId = (jobs[0]?.payload as { readonly roomId: string }).roomId;
+		const domainRoomId = getRoomId(jobs[0] as WorkflowState["pendingJobs"][number]);
 		expect(() =>
-			applyCommand(state, {
-				kind: "room_completed",
-				commandId: `wrong-room-kind:${taskId}`,
-				taskId: state.taskId,
-				timestamp: 130,
-				roomId: domainRoomId as ReturnType<typeof createRoomId>,
-				result: createDomainRoomResult(
-					domainRoomId as ReturnType<typeof createRoomId>,
+			applyCommand(
+				state,
+				createRoomCompletedCommand(
+					state.taskId as ReturnType<typeof createTaskId>,
+					domainRoomId,
 					130,
 					"synthesis",
 				),
-			}),
+			),
 		).toThrow(/internalPhase synthesis/);
 
 		expect(() =>
 			applyCommand(state, {
-				kind: "room_completed",
+				kind: "start_room",
 				commandId: `wrong-room-id:${taskId}`,
 				taskId: state.taskId,
 				timestamp: 131,
-				roomId: domainRoomId as ReturnType<typeof createRoomId>,
-				result: createDomainRoomResult(createRoomId(), 131),
+				roomId: createRoomId(),
+				roomKind: "domain",
+				agentIds: [createAgentId()],
 			}),
-		).toThrow(/does not match command roomId/);
+		).toThrow(/pending room job/);
 
 		const { state: synthesisState, jobs: synthesisJobs } = buildSynthesisState();
-		const activeSynthesisRoomId = (synthesisJobs[0]?.payload as { readonly roomId: string }).roomId;
+		const activeSynthesisRoomId = getRoomId(
+			synthesisJobs[0] as WorkflowState["pendingJobs"][number],
+		);
 		const [completedSourceRoomId] = synthesisState.completedRoomIds;
 		expect(() =>
 			applyCommand(synthesisState, {
@@ -685,7 +758,7 @@ describe("workflow reducer", () => {
 			commandId: `query-before-response:${taskId}`,
 			taskId: synthesisState.taskId,
 			timestamp: 140,
-			synthesisRoomId: activeSynthesisRoomId as ReturnType<typeof createRoomId>,
+			synthesisRoomId: activeSynthesisRoomId,
 			targetRoomId: completedSourceRoomId as ReturnType<typeof createRoomId>,
 			question: "What changed?",
 			relevantIssueIds: [createIssueId()],
@@ -718,18 +791,29 @@ describe("workflow reducer", () => {
 		).toThrow(/terminal state failed/);
 
 		expect(() =>
-			applyCommand(state, {
+			applyCommand(
+				state,
+				createRoomCompletedCommand(
+					state.taskId as ReturnType<typeof createTaskId>,
+					domainRoomId,
+					132,
+					"domain",
+					"failed",
+				),
+			),
+		).toThrow(/completed or inconclusive/);
+
+		expect(() =>
+			applyEvent(state, {
 				kind: "room_completed",
-				commandId: `non-completed-outcome:${taskId}`,
+				commandId: `invalid-replay:${taskId}`,
 				taskId: state.taskId,
-				timestamp: 132,
-				roomId: domainRoomId as ReturnType<typeof createRoomId>,
-				result: {
-					...createDomainRoomResult(domainRoomId as ReturnType<typeof createRoomId>, 132),
-					outcome: "failed",
-				},
+				timestamp: 133,
+				roomId: domainRoomId,
+				roomKind: "domain",
+				outcome: "failed",
 			}),
-		).toThrow(/outcome completed/);
+		).toThrow(/room_failed/);
 	});
 
 	it("replays command-generated events into the same final state", () => {
@@ -745,24 +829,16 @@ describe("workflow reducer", () => {
 			bundleId: "bundle-1",
 		});
 		const roomJobs = contextTransition.jobs;
-		const roomA = (roomJobs[0]?.payload as { readonly roomId: string }).roomId;
-		const roomB = (roomJobs[1]?.payload as { readonly roomId: string }).roomId;
-		const firstRoomTransition = applyCommand(contextTransition.newState, {
-			kind: "room_completed",
-			commandId: `domain-a:${taskId}`,
-			taskId,
-			timestamp: 120,
-			roomId: roomA as ReturnType<typeof createRoomId>,
-			result: createDomainRoomResult(roomA as ReturnType<typeof createRoomId>, 120),
-		});
-		const finalTransition = applyCommand(firstRoomTransition.newState, {
-			kind: "room_completed",
-			commandId: `domain-b:${taskId}`,
-			taskId,
-			timestamp: 130,
-			roomId: roomB as ReturnType<typeof createRoomId>,
-			result: createDomainRoomResult(roomB as ReturnType<typeof createRoomId>, 130),
-		});
+		const roomA = getRoomId(roomJobs[0] as WorkflowState["pendingJobs"][number]);
+		const roomB = getRoomId(roomJobs[1] as WorkflowState["pendingJobs"][number]);
+		const firstRoomTransition = applyCommand(
+			contextTransition.newState,
+			createRoomCompletedCommand(taskId, roomA, 120),
+		);
+		const finalTransition = applyCommand(
+			firstRoomTransition.newState,
+			createRoomCompletedCommand(taskId, roomB, 130),
+		);
 
 		const allEvents = [
 			...submitTransition.events,
@@ -787,26 +863,10 @@ describe("workflow reducer", () => {
 				bundleId: "bundle-1",
 			},
 		]);
-		const roomIds = state.pendingJobs.map(
-			(job) => (job.payload as { readonly roomId: string }).roomId,
-		);
+		const roomIds = state.pendingJobs.map((job) => getRoomId(job));
 		const replay = applyCommands(state, [
-			{
-				kind: "room_completed",
-				commandId: `domain-a:${taskId}`,
-				taskId,
-				timestamp: 120,
-				roomId: roomIds[0] as ReturnType<typeof createRoomId>,
-				result: createDomainRoomResult(roomIds[0] as ReturnType<typeof createRoomId>, 120),
-			},
-			{
-				kind: "room_completed",
-				commandId: `domain-b:${taskId}`,
-				taskId,
-				timestamp: 130,
-				roomId: roomIds[1] as ReturnType<typeof createRoomId>,
-				result: createDomainRoomResult(roomIds[1] as ReturnType<typeof createRoomId>, 130),
-			},
+			createRoomCompletedCommand(taskId, roomIds[0] as ReturnType<typeof createRoomId>, 120),
+			createRoomCompletedCommand(taskId, roomIds[1] as ReturnType<typeof createRoomId>, 130),
 		]);
 
 		const snapshot = projectState(events);

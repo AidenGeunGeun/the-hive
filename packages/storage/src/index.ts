@@ -10,6 +10,12 @@ export interface WorkflowEventRecord {
 	readonly createdAtMs: number;
 }
 
+export interface PersistableWorkflowEvent {
+	readonly eventType: string;
+	readonly payloadJson: string;
+	readonly createdAtMs: number;
+}
+
 export interface WorkflowSnapshotRecord {
 	readonly taskId: string;
 	readonly eventSeq: number;
@@ -50,6 +56,31 @@ export interface QueryResponseArtifactRecord {
 	readonly question: string;
 	readonly payloadJson: string;
 	readonly createdAtMs: number;
+}
+
+export interface RoomArtifactRecord {
+	readonly roomId: string;
+	readonly artifactKind: string;
+	readonly content: string;
+	readonly pathHint: string | null;
+	readonly createdAtMs: number;
+}
+
+export interface ReviewPacketRecord {
+	readonly taskId: string;
+	readonly version: number;
+	readonly packetJson: string;
+	readonly createdAtMs: number;
+}
+
+export interface TaskIndexRecord {
+	readonly taskId: string;
+	readonly externalState: string;
+	readonly internalPhase: string;
+	readonly prompt: string;
+	readonly latestEventSeq: number;
+	readonly createdAtMs: number;
+	readonly updatedAtMs: number;
 }
 
 const MIGRATIONS_SQL = [
@@ -101,6 +132,29 @@ const MIGRATIONS_SQL = [
 		question TEXT NOT NULL,
 		payload_json TEXT NOT NULL,
 		created_at_ms INTEGER NOT NULL
+	);`,
+	`CREATE TABLE IF NOT EXISTS room_artifacts (
+		room_id TEXT NOT NULL PRIMARY KEY,
+		artifact_kind TEXT NOT NULL,
+		content TEXT NOT NULL,
+		path_hint TEXT,
+		created_at_ms INTEGER NOT NULL
+	);`,
+	`CREATE TABLE IF NOT EXISTS review_packets (
+		task_id TEXT NOT NULL,
+		version INTEGER NOT NULL,
+		packet_json TEXT NOT NULL,
+		created_at_ms INTEGER NOT NULL,
+		PRIMARY KEY (task_id, version)
+	);`,
+	`CREATE TABLE IF NOT EXISTS tasks (
+		task_id TEXT NOT NULL PRIMARY KEY,
+		external_state TEXT NOT NULL,
+		internal_phase TEXT NOT NULL,
+		prompt TEXT NOT NULL,
+		latest_event_seq INTEGER NOT NULL,
+		created_at_ms INTEGER NOT NULL,
+		updated_at_ms INTEGER NOT NULL
 	);`,
 	"DROP VIEW IF EXISTS current_issue_state_v;",
 	"DROP VIEW IF EXISTS open_issues_v;",
@@ -226,6 +280,31 @@ export function appendWorkflowEvents(
 		assertMatches(taskId, event.taskId, "taskId");
 		statement.run(event.taskId, event.seq, event.eventType, event.payloadJson, event.createdAtMs);
 	}
+}
+
+export function appendWorkflowEventsAutoSeq(
+	db: Database,
+	taskId: string,
+	events: readonly PersistableWorkflowEvent[],
+): readonly WorkflowEventRecord[] {
+	if (events.length === 0) {
+		return [];
+	}
+
+	const row = db
+		.query("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM workflow_events WHERE task_id = ?1")
+		.get(taskId) as Record<string, unknown> | null;
+	const baseSeq = (row?.max_seq as number | undefined) ?? 0;
+	const persistedEvents = events.map((event, index) => ({
+		taskId,
+		seq: baseSeq + index + 1,
+		eventType: event.eventType,
+		payloadJson: event.payloadJson,
+		createdAtMs: event.createdAtMs,
+	}));
+
+	appendWorkflowEvents(db, taskId, persistedEvents);
+	return persistedEvents;
 }
 
 export function readWorkflowEvents(
@@ -373,6 +452,108 @@ export function readQueryResponseArtifacts(
 	);
 }
 
+export function appendRoomArtifact(db: Database, artifact: RoomArtifactRecord): void {
+	db.prepare(
+		"INSERT INTO room_artifacts (room_id, artifact_kind, content, path_hint, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+	).run(
+		artifact.roomId,
+		artifact.artifactKind,
+		artifact.content,
+		artifact.pathHint,
+		artifact.createdAtMs,
+	);
+}
+
+export function readRoomArtifact(db: Database, roomId: string): RoomArtifactRecord | null {
+	const row = db
+		.query(
+			"SELECT room_id, artifact_kind, content, path_hint, created_at_ms FROM room_artifacts WHERE room_id = ?1",
+		)
+		.get(roomId);
+
+	if (!row) {
+		return null;
+	}
+
+	return mapRoomArtifactRow(row as Record<string, unknown>);
+}
+
+export function writeReviewPacket(db: Database, packet: ReviewPacketRecord): void {
+	db.prepare(
+		"INSERT INTO review_packets (task_id, version, packet_json, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+	).run(packet.taskId, packet.version, packet.packetJson, packet.createdAtMs);
+}
+
+export function readReviewPacket(
+	db: Database,
+	taskId: string,
+	version: number,
+): ReviewPacketRecord | null {
+	const row = db
+		.query(
+			"SELECT task_id, version, packet_json, created_at_ms FROM review_packets WHERE task_id = ?1 AND version = ?2",
+		)
+		.get(taskId, version);
+
+	if (!row) {
+		return null;
+	}
+
+	return mapReviewPacketRow(row as Record<string, unknown>);
+}
+
+export function readLatestReviewPacket(db: Database, taskId: string): ReviewPacketRecord | null {
+	const row = db
+		.query(
+			"SELECT task_id, version, packet_json, created_at_ms FROM review_packets WHERE task_id = ?1 ORDER BY version DESC LIMIT 1",
+		)
+		.get(taskId);
+
+	if (!row) {
+		return null;
+	}
+
+	return mapReviewPacketRow(row as Record<string, unknown>);
+}
+
+export function upsertTaskIndex(db: Database, task: TaskIndexRecord): void {
+	db.prepare(
+		"INSERT INTO tasks (task_id, external_state, internal_phase, prompt, latest_event_seq, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(task_id) DO UPDATE SET external_state = excluded.external_state, internal_phase = excluded.internal_phase, prompt = excluded.prompt, latest_event_seq = excluded.latest_event_seq, created_at_ms = excluded.created_at_ms, updated_at_ms = excluded.updated_at_ms",
+	).run(
+		task.taskId,
+		task.externalState,
+		task.internalPhase,
+		task.prompt,
+		task.latestEventSeq,
+		task.createdAtMs,
+		task.updatedAtMs,
+	);
+}
+
+export function readTaskIndex(db: Database, taskId: string): TaskIndexRecord | null {
+	const row = db
+		.query(
+			"SELECT task_id, external_state, internal_phase, prompt, latest_event_seq, created_at_ms, updated_at_ms FROM tasks WHERE task_id = ?1",
+		)
+		.get(taskId);
+
+	if (!row) {
+		return null;
+	}
+
+	return mapTaskIndexRow(row as Record<string, unknown>);
+}
+
+export function listRecoverableTasks(db: Database): readonly TaskIndexRecord[] {
+	return mapTaskIndexRows(
+		db
+			.query(
+				"SELECT task_id, external_state, internal_phase, prompt, latest_event_seq, created_at_ms, updated_at_ms FROM tasks WHERE external_state NOT IN ('approved', 'cancelled', 'failed') ORDER BY task_id ASC",
+			)
+			.all(),
+	);
+}
+
 function assertMatches(expected: string, actual: string, fieldName: string): void {
 	if (expected !== actual) {
 		throw new StorageRecordMismatchError(
@@ -452,4 +633,39 @@ function mapQueryArtifactRows(rows: unknown[]): readonly QueryResponseArtifactRe
 			createdAtMs: record.created_at_ms as number,
 		};
 	});
+}
+
+function mapRoomArtifactRow(row: Record<string, unknown>): RoomArtifactRecord {
+	return {
+		roomId: row.room_id as string,
+		artifactKind: row.artifact_kind as string,
+		content: row.content as string,
+		pathHint: (row.path_hint as string | null) ?? null,
+		createdAtMs: row.created_at_ms as number,
+	};
+}
+
+function mapReviewPacketRow(row: Record<string, unknown>): ReviewPacketRecord {
+	return {
+		taskId: row.task_id as string,
+		version: row.version as number,
+		packetJson: row.packet_json as string,
+		createdAtMs: row.created_at_ms as number,
+	};
+}
+
+function mapTaskIndexRows(rows: unknown[]): readonly TaskIndexRecord[] {
+	return rows.map((row) => mapTaskIndexRow(row as Record<string, unknown>));
+}
+
+function mapTaskIndexRow(row: Record<string, unknown>): TaskIndexRecord {
+	return {
+		taskId: row.task_id as string,
+		externalState: row.external_state as string,
+		internalPhase: row.internal_phase as string,
+		prompt: row.prompt as string,
+		latestEventSeq: row.latest_event_seq as number,
+		createdAtMs: row.created_at_ms as number,
+		updatedAtMs: row.updated_at_ms as number,
+	};
 }

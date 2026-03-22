@@ -34,6 +34,20 @@ export interface PendingJob {
 	readonly dedupeKey: string;
 }
 
+export interface WorkflowPlan {
+	readonly includeSynthesis: boolean;
+	readonly allowQueryBack: boolean;
+	readonly allowRerun: boolean;
+}
+
+export interface WorkflowSubmission {
+	readonly prompt: string;
+	readonly bundleInputPath: string;
+	readonly requestedDomains: readonly string[];
+	readonly configProfile?: string;
+	readonly plan: WorkflowPlan;
+}
+
 export interface WorkflowState {
 	readonly taskId: TaskId;
 	readonly externalState: ExternalTaskState;
@@ -41,9 +55,10 @@ export interface WorkflowState {
 	readonly iteration: number;
 	readonly pendingJobs: readonly PendingJob[];
 	readonly completedRoomIds: readonly RoomId[];
-	readonly bundleId?: string;
 	readonly reviewPacketVersion: number;
 	readonly maxIterations: number;
 	readonly createdAtMs: number;
 	readonly updatedAtMs: number;
+	readonly bundleId?: string;
+	readonly submission?: WorkflowSubmission;
 }

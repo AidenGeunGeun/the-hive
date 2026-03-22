@@ -1,25 +1,21 @@
 import type {
+	AgentId,
 	IssueId,
 	PendingJob,
 	RoomId,
-	RoomRunResult,
+	RoomKind,
+	RoomRunOutcome,
 	TaskId,
+	WorkflowPlan,
 	WorkflowState,
+	WorkflowSubmission,
 } from "@the-hive/protocol/engine";
 
 const DEFAULT_REQUESTED_DOMAINS = ["general"] as const;
 
-interface WorkflowSubmission {
-	readonly prompt: string;
-	readonly bundleInputPath: string;
-	readonly requestedDomains: readonly string[];
-	readonly configProfile?: string;
-}
-
 interface WorkflowMetadata {
 	readonly processedCommandIds: readonly string[];
 	readonly queryBackSequence: number;
-	readonly submission?: WorkflowSubmission;
 }
 
 interface WorkflowRuntimeState extends WorkflowState {
@@ -42,6 +38,7 @@ export interface SubmitTaskWorkflowCommand extends WorkflowCommandBase {
 	readonly bundleInputPath: string;
 	readonly requestedDomains?: readonly string[];
 	readonly configProfile?: string;
+	readonly plan: WorkflowPlan;
 	readonly submittedAtMs: number;
 }
 
@@ -54,10 +51,19 @@ export interface ContextBundleBuiltWorkflowCommand extends TimedWorkflowCommandB
 	readonly bundleId: string;
 }
 
+export interface StartRoomWorkflowCommand extends TimedWorkflowCommandBase {
+	readonly kind: "start_room";
+	readonly roomId: RoomId;
+	readonly roomKind: RoomKind;
+	readonly domain?: string;
+	readonly agentIds: readonly AgentId[];
+}
+
 export interface RoomCompletedWorkflowCommand extends TimedWorkflowCommandBase {
 	readonly kind: "room_completed";
 	readonly roomId: RoomId;
-	readonly result: RoomRunResult;
+	readonly roomKind: RoomKind;
+	readonly outcome: RoomRunOutcome;
 }
 
 export interface RoomFailedWorkflowCommand extends TimedWorkflowCommandBase {
@@ -91,7 +97,7 @@ export interface ApproveTaskWorkflowCommand extends TimedWorkflowCommandBase {
 
 export interface RejectTaskWorkflowCommand extends TimedWorkflowCommandBase {
 	readonly kind: "reject_task";
-	readonly feedback: string;
+	readonly feedback: readonly string[];
 }
 
 export interface CancelTaskWorkflowCommand extends TimedWorkflowCommandBase {
@@ -108,6 +114,7 @@ export type WorkflowCommand =
 	| SubmitTaskWorkflowCommand
 	| StartTaskWorkflowCommand
 	| ContextBundleBuiltWorkflowCommand
+	| StartRoomWorkflowCommand
 	| RoomCompletedWorkflowCommand
 	| RoomFailedWorkflowCommand
 	| QueryRoomRequestedWorkflowCommand
@@ -131,6 +138,7 @@ export interface TaskSubmittedWorkflowEvent extends WorkflowEventBase {
 	readonly bundleInputPath: string;
 	readonly requestedDomains: readonly string[];
 	readonly configProfile?: string;
+	readonly plan: WorkflowPlan;
 	readonly maxIterations: number;
 }
 
@@ -154,12 +162,16 @@ export interface RoomJobEnqueuedWorkflowEvent extends WorkflowEventBase {
 export interface RoomStartedWorkflowEvent extends WorkflowEventBase {
 	readonly kind: "room_started";
 	readonly roomId: RoomId;
+	readonly roomKind: RoomKind;
+	readonly domain?: string;
+	readonly agentIds: readonly AgentId[];
 }
 
 export interface RoomCompletedWorkflowEvent extends WorkflowEventBase {
 	readonly kind: "room_completed";
 	readonly roomId: RoomId;
-	readonly result: RoomRunResult;
+	readonly roomKind: RoomKind;
+	readonly outcome: RoomRunOutcome;
 }
 
 export interface RoomFailedWorkflowEvent extends WorkflowEventBase {
@@ -199,7 +211,7 @@ export interface TaskApprovedWorkflowEvent extends WorkflowEventBase {
 
 export interface TaskRejectedWorkflowEvent extends WorkflowEventBase {
 	readonly kind: "task_rejected";
-	readonly feedback: string;
+	readonly feedback: readonly string[];
 }
 
 export interface TaskCancelledWorkflowEvent extends WorkflowEventBase {
@@ -303,11 +315,9 @@ export function applyEvent(state: WorkflowState, event: WorkflowEvent): Workflow
 					...runtimeState,
 					createdAtMs: runtimeState.createdAtMs === 0 ? event.timestamp : runtimeState.createdAtMs,
 					updatedAtMs: event.timestamp,
-				},
-				{
-					...runtimeState._workflow,
 					submission: buildSubmission(event),
 				},
+				runtimeState._workflow,
 			);
 		case "task_started":
 			return withWorkflowMetadata(
@@ -352,9 +362,14 @@ export function applyEvent(state: WorkflowState, event: WorkflowEvent): Workflow
 				runtimeState._workflow,
 			);
 		case "room_completed": {
-			const pendingJobs = removeRoomJob(runtimeState.pendingJobs, event.roomId, event.result.kind);
+			if (event.outcome === "failed") {
+				throw new WorkflowProjectionError(
+					"room_completed events cannot use failed outcome; use room_failed instead",
+				);
+			}
+			const pendingJobs = removeRoomJob(runtimeState.pendingJobs, event.roomId, event.roomKind);
 			const completedRoomIds =
-				event.result.kind === "query_back"
+				event.roomKind === "query_back"
 					? runtimeState.completedRoomIds
 					: runtimeState.completedRoomIds.includes(event.roomId)
 						? runtimeState.completedRoomIds
@@ -499,15 +514,15 @@ export function projectState(
 
 function normalizeState(state: WorkflowState): WorkflowRuntimeState {
 	const runtimeState = state as WorkflowRuntimeState;
-	const submission = runtimeState._workflow?.submission;
+	const submission = runtimeState.submission;
 
 	return {
 		...state,
 		_workflow: {
 			processedCommandIds: runtimeState._workflow?.processedCommandIds ?? [],
 			queryBackSequence: runtimeState._workflow?.queryBackSequence ?? 0,
-			...(submission ? { submission: { ...submission } } : {}),
 		},
+		...(submission ? { submission: { ...submission } } : {}),
 	} as WorkflowRuntimeState;
 }
 
@@ -528,6 +543,7 @@ function buildCommandEvents(
 				bundleInputPath: command.bundleInputPath,
 				requestedDomains,
 				...(command.configProfile ? { configProfile: command.configProfile } : {}),
+				plan: command.plan,
 				maxIterations: state.maxIterations,
 			};
 			const startedEvent = createTaskStartedEvent(command, state, command.submittedAtMs);
@@ -560,7 +576,7 @@ function buildCommandEvents(
 				timestamp: command.timestamp,
 				bundleId: command.bundleId,
 			};
-			const roomEvents = submission.requestedDomains.map((domain, index) =>
+			const roomEvents = submission.requestedDomains.map((domain: string, index: number) =>
 				createRoomJobEnqueuedEvent(
 					command,
 					createDomainRoomJob(command.taskId, state.iteration, command.bundleId, domain, index),
@@ -569,17 +585,28 @@ function buildCommandEvents(
 			);
 			return [builtEvent, ...roomEvents];
 		}
+		case "start_room": {
+			requireRoomPhase(state, command.roomKind, command.kind);
+			requireRoomJob(state, command.roomId, command.kind, command.roomKind);
+			return [
+				{
+					kind: "room_started",
+					commandId: command.commandId,
+					taskId: command.taskId,
+					timestamp: command.timestamp,
+					roomId: command.roomId,
+					roomKind: command.roomKind,
+					...(command.domain ? { domain: command.domain } : {}),
+					agentIds: command.agentIds,
+				},
+			];
+		}
 		case "room_completed": {
-			requireRoomPhase(state, command.result.kind, command.kind);
-			requireRoomJob(state, command.roomId, command.kind, command.result.kind);
-			if (command.result.outcome !== "completed") {
+			requireRoomPhase(state, command.roomKind, command.kind);
+			requireRoomJob(state, command.roomId, command.kind, command.roomKind);
+			if (command.outcome !== "completed" && command.outcome !== "inconclusive") {
 				throw new WorkflowError(
-					`room_completed requires outcome completed, received ${command.result.outcome}`,
-				);
-			}
-			if (command.result.roomId !== command.roomId) {
-				throw new WorkflowError(
-					`room_completed result roomId ${command.result.roomId} does not match command roomId ${command.roomId}`,
+					`room_completed requires outcome completed or inconclusive, received ${command.outcome}`,
 				);
 			}
 			const completedEvent: RoomCompletedWorkflowEvent = {
@@ -588,35 +615,41 @@ function buildCommandEvents(
 				taskId: command.taskId,
 				timestamp: command.timestamp,
 				roomId: command.roomId,
-				result: command.result,
+				roomKind: command.roomKind,
+				outcome: command.outcome,
 			};
 
-			if (command.result.kind === "domain") {
+			if (command.roomKind === "domain") {
 				const remainingDomainJobs = removeRoomJob(
 					state.pendingJobs,
 					command.roomId,
 					"domain",
 				).filter((job) => job.kind === "run_domain_room");
 				if (remainingDomainJobs.length === 0) {
-					const synthesisJob = createSynthesisRoomJob(
-						command.taskId,
-						state.iteration,
-						state.completedRoomIds.includes(command.roomId)
-							? state.completedRoomIds
-							: [...state.completedRoomIds, command.roomId],
-					);
-					return [
-						completedEvent,
-						createRoomJobEnqueuedEvent(command, synthesisJob, command.timestamp),
-					];
+					const sourceRoomIds = state.completedRoomIds.includes(command.roomId)
+						? state.completedRoomIds
+						: [...state.completedRoomIds, command.roomId];
+					const submission = requireSubmission(state, command.kind);
+					const nextJob = submission.plan.includeSynthesis
+						? createSynthesisRoomJob(command.taskId, state.iteration, sourceRoomIds)
+						: createRenderReviewPacketJob(
+								command.taskId,
+								state.iteration,
+								state.reviewPacketVersion + 1,
+								sourceRoomIds,
+								"domain",
+							);
+					return [completedEvent, createRoomJobEnqueuedEvent(command, nextJob, command.timestamp)];
 				}
 			}
 
-			if (command.result.kind === "synthesis") {
+			if (command.roomKind === "synthesis") {
 				const renderJob = createRenderReviewPacketJob(
 					command.taskId,
 					state.iteration,
 					state.reviewPacketVersion + 1,
+					[command.roomId],
+					"synthesis",
 				);
 				return [completedEvent, createRoomJobEnqueuedEvent(command, renderJob, command.timestamp)];
 			}
@@ -831,7 +864,7 @@ function createBuildContextJob(
 	taskId: TaskId,
 	iteration: number,
 	submission: WorkflowSubmission,
-	feedback?: string,
+	feedback?: readonly string[],
 ): PendingJob {
 	return {
 		jobId: `task:${taskId}:build_context:${iteration}`,
@@ -916,6 +949,8 @@ function createRenderReviewPacketJob(
 	taskId: TaskId,
 	iteration: number,
 	version: number,
+	sourceRoomIds: readonly RoomId[],
+	sourceStage: "domain" | "synthesis",
 ): PendingJob {
 	return {
 		jobId: `task:${taskId}:render:${version}`,
@@ -924,6 +959,8 @@ function createRenderReviewPacketJob(
 		payload: {
 			version,
 			iteration,
+			sourceRoomIds,
+			sourceStage,
 		},
 		dedupeKey: `render:${taskId}:${version}`,
 	};
@@ -944,7 +981,7 @@ function enqueueJob(pendingJobs: readonly PendingJob[], job: PendingJob): readon
 function removeRoomJob(
 	pendingJobs: readonly PendingJob[],
 	roomId: RoomId,
-	kind?: RoomRunResult["kind"],
+	kind?: RoomKind,
 ): readonly PendingJob[] {
 	return pendingJobs.filter((job) => {
 		if (!isRoomJob(job)) {
@@ -974,7 +1011,7 @@ function isRoomJob(
 	return typeof payload.roomId === "string";
 }
 
-function roomKindForJob(jobKind: PendingJob["kind"]): RoomRunResult["kind"] | null {
+function roomKindForJob(jobKind: PendingJob["kind"]): RoomKind | null {
 	switch (jobKind) {
 		case "run_domain_room":
 			return "domain";
@@ -989,7 +1026,7 @@ function roomKindForJob(jobKind: PendingJob["kind"]): RoomRunResult["kind"] | nu
 
 function requireRoomPhase(
 	state: WorkflowState,
-	roomKind: RoomRunResult["kind"] | null,
+	roomKind: RoomKind | null,
 	commandKind: WorkflowCommand["kind"],
 ): void {
 	if (!roomKind) {
@@ -1002,7 +1039,7 @@ function requireRoomPhase(
 	}
 }
 
-function phaseForRoomKind(kind: RoomRunResult["kind"]): WorkflowState["internalPhase"] {
+function phaseForRoomKind(kind: RoomKind): WorkflowState["internalPhase"] {
 	switch (kind) {
 		case "domain":
 			return "mini_rooms";
@@ -1039,6 +1076,7 @@ function buildSubmission(event: TaskSubmittedWorkflowEvent): WorkflowSubmission 
 		bundleInputPath: event.bundleInputPath,
 		requestedDomains: event.requestedDomains,
 		...(event.configProfile ? { configProfile: event.configProfile } : {}),
+		plan: event.plan,
 	};
 }
 
@@ -1046,9 +1084,9 @@ function requireSubmission(
 	state: WorkflowRuntimeState,
 	commandKind: WorkflowCommand["kind"],
 ): WorkflowSubmission {
-	const submission = state._workflow.submission;
+	const submission = state.submission;
 	if (!submission) {
-		throw new WorkflowError(`${commandKind} requires submission metadata`);
+		throw new WorkflowError(`${commandKind} requires submission data`);
 	}
 
 	return submission;
@@ -1071,7 +1109,7 @@ function requireRoomJob(
 	state: WorkflowRuntimeState,
 	roomId: RoomId,
 	commandKind: WorkflowCommand["kind"],
-	expectedRoomKind?: RoomRunResult["kind"],
+	expectedRoomKind?: RoomKind,
 ): PendingJob {
 	const roomJob = state.pendingJobs.find((job) => isRoomJob(job) && job.payload.roomId === roomId);
 	if (!roomJob) {
@@ -1102,7 +1140,6 @@ function registerProcessedCommand(
 		...state._workflow,
 		processedCommandIds: [...state._workflow.processedCommandIds, commandId],
 		queryBackSequence: state._workflow.queryBackSequence,
-		...(state._workflow.submission ? { submission: state._workflow.submission } : {}),
 	});
 }
 

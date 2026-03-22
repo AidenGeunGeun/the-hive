@@ -72,5 +72,7 @@ export type {
 	InternalPhase,
 	JobKind,
 	PendingJob,
+	WorkflowPlan,
+	WorkflowSubmission,
 	WorkflowState,
 } from "./workflow";

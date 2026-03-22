@@ -8,12 +8,19 @@ export type {
 	WireCommand,
 	WireCommandEnvelope,
 } from "./commands";
-export type { WireError, WireErrorCode } from "./errors";
+export type {
+	TaskFailureCode,
+	WireError,
+	WireErrorCode,
+	WireErrorEnvelope,
+	WireServerMessage,
+} from "./errors";
 export type {
 	RoomCompletedEvent,
 	RoomStartedEvent,
 	TaskCancelledEvent,
 	TaskFailedEvent,
+	TaskSnapshotEvent,
 	TaskReviewReadyEvent,
 	TaskStateChangedEvent,
 	WireEvent,
@@ -58,16 +65,20 @@ export {
 	submitTaskCommandSchema,
 	subscribeTaskCommandSchema,
 	taskCancelledEventSchema,
+	taskFailureCodeSchema,
 	taskFailedEventSchema,
+	taskSnapshotEventSchema,
 	taskReviewReadyEventSchema,
 	taskSnapshotViewSchema,
 	taskStateChangedEventSchema,
 	wireCommandEnvelopeSchema,
 	wireCommandSchema,
 	wireErrorCodeSchema,
+	wireErrorEnvelopeSchema,
 	wireErrorSchema,
 	wireEventEnvelopeSchema,
 	wireEventSchema,
+	wireServerMessageSchema,
 } from "./schemas";
 export type {
 	ArraySchema,

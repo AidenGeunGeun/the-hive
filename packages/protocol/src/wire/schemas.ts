@@ -154,7 +154,7 @@ export const issueSummaryViewSchema = {
 		issueId: stringSchema,
 		title: stringSchema,
 		state: issueStateViewSchema,
-		domain: stringSchema,
+		domain: optionalStringSchema,
 	},
 } as const satisfies ObjectSchema;
 
@@ -181,7 +181,8 @@ export const evidenceTraceLinkViewSchema = {
 	type: "object",
 	properties: {
 		issueId: stringSchema,
-		sectionRef: stringSchema,
+		sectionRef: optionalStringSchema,
+		evidence: optionalStringSchema,
 		excerpt: optionalStringSchema,
 	},
 } as const satisfies ObjectSchema;
@@ -339,6 +340,13 @@ export const roomCompletedEventSchema = {
 		taskId: stringSchema,
 		roomId: stringSchema,
 		roomKind: roomKindViewSchema,
+		outcome: {
+			type: "union",
+			anyOf: [
+				{ type: "literal", value: "completed" },
+				{ type: "literal", value: "inconclusive" },
+			],
+		},
 		completedAtMs: numberSchema,
 	},
 } as const satisfies ObjectSchema;
@@ -364,12 +372,23 @@ export const wireErrorCodeSchema = {
 	],
 } as const satisfies UnionSchema;
 
+export const taskFailureCodeSchema = {
+	type: "union",
+	anyOf: [
+		{ type: "literal", value: "context_build_failed" },
+		{ type: "literal", value: "room_failed" },
+		{ type: "literal", value: "render_failed" },
+		{ type: "literal", value: "max_iterations_exceeded" },
+		{ type: "literal", value: "internal_error" },
+	],
+} as const satisfies UnionSchema;
+
 export const taskFailedEventSchema = {
 	type: "object",
 	properties: {
 		kind: { type: "literal", value: "task_failed" },
 		taskId: stringSchema,
-		errorCode: wireErrorCodeSchema,
+		errorCode: taskFailureCodeSchema,
 		message: stringSchema,
 		failedAtMs: numberSchema,
 	},
@@ -384,6 +403,16 @@ export const taskCancelledEventSchema = {
 	},
 } as const satisfies ObjectSchema;
 
+export const taskSnapshotEventSchema = {
+	type: "object",
+	properties: {
+		kind: { type: "literal", value: "task_snapshot" },
+		commandId: stringSchema,
+		snapshot: taskSnapshotViewSchema,
+		sentAtMs: numberSchema,
+	},
+} as const satisfies ObjectSchema;
+
 export const wireEventSchema = {
 	type: "union",
 	anyOf: [
@@ -393,6 +422,7 @@ export const wireEventSchema = {
 		taskReviewReadyEventSchema,
 		taskFailedEventSchema,
 		taskCancelledEventSchema,
+		taskSnapshotEventSchema,
 	],
 } as const satisfies UnionSchema;
 
@@ -412,3 +442,17 @@ export const wireErrorSchema = {
 		details: { ...unknownSchema, optional: true },
 	},
 } as const satisfies ObjectSchema;
+
+export const wireErrorEnvelopeSchema = {
+	type: "object",
+	properties: {
+		protocolVersion: protocolVersionSchema,
+		commandId: stringSchema,
+		error: wireErrorSchema,
+	},
+} as const satisfies ObjectSchema;
+
+export const wireServerMessageSchema = {
+	type: "union",
+	anyOf: [wireEventEnvelopeSchema, wireErrorEnvelopeSchema],
+} as const satisfies UnionSchema;

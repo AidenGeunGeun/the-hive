@@ -7,11 +7,12 @@ Contracts-first, then vertical slices. Do not finish every package horizontally 
 1. **Phase 0–1** — Freeze boundaries and contracts.
 2. **Phase 2 + Phase 3 in parallel** — Build state authority and room core.
 3. **Phase 4** — Prove a live room before adding more orchestration.
-4. **Phase 5** — Prove a real end-to-end path with one room.
-5. **Phase 6** — Replace fixtures with real context bundles and multi-room Stage 1.
-6. **Phase 7** — Add synthesis and human review.
-7. **Phase 8** — Add query-back and rerun only after nominal flow works.
-8. **Phase 9** — Run the eval gate before expanding feature scope.
+4. **Phase 4.5** — Pre-integration structural fixes (persistence authority, wire gaps, workflow slimming).
+5. **Phase 5** — Prove a real end-to-end path with one room.
+6. **Phase 6** — Replace fixtures with real context bundles and multi-room Stage 1.
+7. **Phase 7** — Add synthesis and human review.
+8. **Phase 8** — Add query-back and rerun only after nominal flow works.
+9. **Phase 9** — Run the eval gate before expanding feature scope.
 
 ## Parallelization Opportunities
 
@@ -597,6 +598,425 @@ For each turn:
 
 ---
 
+## Phase 4.5 — Pre-integration structural fixes
+
+**Goal**
+Fix the persistence authority model, fill wire protocol gaps, and slim the workflow event model so Phase 5 server composition is mechanical rather than a patchwork of workarounds.
+
+**Background**
+An external architecture review of the Phase 5 integration surface found: (1) `room_completed` workflow events carry full `RoomRunResult`, blurring the authority split between workflow log and ledger/trace stores; (2) the wire protocol lacks snapshot responses and command-level error reporting; (3) the workflow has no mechanism to skip synthesis, forcing Phase 5 to fake it; (4) `room_started` has no workflow producer, making it invisible to recovery and reconnect; (5) several fields on `ReviewPacketView` have no honest data source.
+
+**Packages involved**
+`@the-hive/protocol` (wire + engine), `@the-hive/workflow`, `@the-hive/storage`
+
+### 1. Protocol Wire Changes
+
+**`packages/protocol/src/wire/errors.ts`** — Add `TaskFailureCode`:
+
+```ts
+export type TaskFailureCode =
+  | "context_build_failed"
+  | "room_failed"
+  | "render_failed"
+  | "max_iterations_exceeded"
+  | "internal_error";
+```
+
+`WireErrorCode` stays unchanged (protocol/command-level errors only).
+
+**`packages/protocol/src/wire/events.ts`** — Add `TaskSnapshotEvent`, update `TaskFailedEvent`:
+
+```ts
+export interface TaskSnapshotEvent {
+  readonly kind: "task_snapshot";
+  readonly commandId: string;
+  readonly snapshot: TaskSnapshotView;
+  readonly sentAtMs: number;
+}
+```
+
+Add `TaskSnapshotEvent` to the `WireEvent` union.
+
+Change `TaskFailedEvent.errorCode` from `WireErrorCode` to `TaskFailureCode`:
+
+```ts
+export interface TaskFailedEvent {
+  readonly kind: "task_failed";
+  readonly taskId: string;
+  readonly errorCode: TaskFailureCode;
+  readonly message: string;
+  readonly failedAtMs: number;
+}
+```
+
+Add `outcome` to `RoomCompletedEvent`:
+
+```ts
+export interface RoomCompletedEvent {
+  readonly kind: "room_completed";
+  readonly taskId: string;
+  readonly roomId: string;
+  readonly roomKind: RoomKindView;
+  readonly outcome: "completed" | "inconclusive";
+  readonly completedAtMs: number;
+}
+```
+
+**`packages/protocol/src/wire/views.ts`** — Two fields become optional:
+
+```ts
+export interface IssueSummaryView {
+  readonly issueId: string;
+  readonly title: string;
+  readonly state: IssueStateView;
+  readonly domain?: string; // was required
+}
+
+export interface EvidenceTraceLinkView {
+  readonly issueId: string;
+  readonly sectionRef?: string; // was required
+  readonly evidence?: string; // new: freeform evidence from ledger
+  readonly excerpt?: string;
+}
+```
+
+**`packages/protocol/src/wire/errors.ts`** — Add `WireErrorEnvelope` and `WireServerMessage`:
+
+```ts
+export interface WireErrorEnvelope {
+  readonly protocolVersion: ProtocolVersion;
+  readonly commandId: string;
+  readonly error: WireError;
+}
+
+export type WireServerMessage = WireEventEnvelope | WireErrorEnvelope;
+```
+
+**`packages/protocol/src/wire/schemas.ts`** — Add runtime schemas for all new types: `taskFailureCodeSchema`, `taskSnapshotEventSchema`, `wireErrorEnvelopeSchema`, `wireServerMessageSchema`. Update `taskFailedEventSchema` to use `taskFailureCodeSchema`. Update `roomCompletedEventSchema` to include `outcome`. Update `issueSummaryViewSchema` for optional `domain`. Update `evidenceTraceLinkViewSchema` for optional `sectionRef` + new `evidence`.
+
+**`packages/protocol/src/wire/index.ts`** — Export all new types and schemas.
+
+### 2. Protocol Engine Changes
+
+**`packages/protocol/src/engine/workflow.ts`** — Add `WorkflowPlan` and `WorkflowSubmission`. Update `WorkflowState`:
+
+```ts
+export interface WorkflowPlan {
+  readonly includeSynthesis: boolean;
+  readonly allowQueryBack: boolean;
+  readonly allowRerun: boolean;
+}
+
+export interface WorkflowSubmission {
+  readonly prompt: string;
+  readonly bundleInputPath: string;
+  readonly requestedDomains: readonly string[];
+  readonly configProfile?: string;
+  readonly plan: WorkflowPlan;
+}
+
+export interface WorkflowState {
+  readonly taskId: TaskId;
+  readonly externalState: ExternalTaskState;
+  readonly internalPhase: InternalPhase;
+  readonly iteration: number;
+  readonly pendingJobs: readonly PendingJob[];
+  readonly completedRoomIds: readonly RoomId[];
+  readonly reviewPacketVersion: number;
+  readonly maxIterations: number;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+  readonly bundleId?: string;
+  readonly submission?: WorkflowSubmission; // replaces hidden _workflow.submission
+}
+```
+
+**`packages/protocol/src/engine/index.ts`** — Export `WorkflowPlan` and `WorkflowSubmission`.
+
+### 3. Workflow Reducer Changes
+
+**`packages/workflow/src/index.ts`** — All changes in this single file.
+
+**3a. New command: `start_room`**
+
+```ts
+export interface StartRoomWorkflowCommand extends TimedWorkflowCommandBase {
+  readonly kind: "start_room";
+  readonly roomId: RoomId;
+  readonly roomKind: RoomKind;
+  readonly domain?: string;
+  readonly agentIds: readonly AgentId[];
+}
+```
+
+Add to `WorkflowCommand` union. Handler validates: a pending room job exists for this `roomId`. Emits enriched `RoomStartedWorkflowEvent`:
+
+```ts
+export interface RoomStartedWorkflowEvent extends WorkflowEventBase {
+  readonly kind: "room_started";
+  readonly roomId: RoomId;
+  readonly roomKind: RoomKind;
+  readonly domain?: string;
+  readonly agentIds: readonly AgentId[];
+}
+```
+
+`applyEvent` for `room_started` updates timestamps only (no state change beyond that). The pending job stays until `room_completed` or `room_failed`.
+
+**3b. Slim `room_completed`**
+
+Before:
+
+```ts
+export interface RoomCompletedWorkflowCommand extends TimedWorkflowCommandBase {
+  readonly kind: "room_completed";
+  readonly roomId: RoomId;
+  readonly result: RoomRunResult;
+}
+```
+
+After:
+
+```ts
+export interface RoomCompletedWorkflowCommand extends TimedWorkflowCommandBase {
+  readonly kind: "room_completed";
+  readonly roomId: RoomId;
+  readonly roomKind: RoomKind;
+  readonly outcome: RoomRunOutcome;
+}
+```
+
+Similarly for the event:
+
+```ts
+export interface RoomCompletedWorkflowEvent extends WorkflowEventBase {
+  readonly kind: "room_completed";
+  readonly roomId: RoomId;
+  readonly roomKind: RoomKind;
+  readonly outcome: RoomRunOutcome;
+}
+```
+
+The handler references change from `command.result.kind` to `command.roomKind`, `command.result.outcome` to `command.outcome`, `command.result.roomId` to `command.roomId`.
+
+Accept both `"completed"` and `"inconclusive"` outcomes. Remove the `outcome !== "completed"` rejection. Failed rooms still go through `room_failed`.
+
+**3c. WorkflowPlan-conditional synthesis**
+
+On last domain room completion, check `submission.plan.includeSynthesis`:
+
+- If `true`: enqueue `run_synthesis_room` (existing behavior).
+- If `false`: enqueue `render_review_packet` directly with `sourceRoomIds` from `completedRoomIds`.
+
+The render job payload gains explicit fields:
+
+```ts
+{
+  version: number;
+  iteration: number;
+  sourceRoomIds: readonly RoomId[];
+  sourceStage: "domain" | "synthesis";
+}
+```
+
+For synthesis completion, the render payload uses `sourceRoomIds: [synthesisRoomId]` and `sourceStage: "synthesis"`.
+
+**3d. Feedback as `string[]`**
+
+Change `RejectTaskWorkflowCommand.feedback` from `string` to `readonly string[]`.
+Change `TaskRejectedWorkflowEvent.feedback` from `string` to `readonly string[]`.
+Change `createBuildContextJob` `feedback` parameter from `string` to `readonly string[]`.
+
+The job payload carries the structured array. Formatting happens downstream at injection time.
+
+**3e. Submission in public state**
+
+Add `plan: WorkflowPlan` to `SubmitTaskWorkflowCommand` and `TaskSubmittedWorkflowEvent`.
+
+Move `WorkflowSubmission` from the internal `_workflow` metadata to public `WorkflowState.submission`. The internal `WorkflowMetadata` retains only `processedCommandIds` and `queryBackSequence`.
+
+`buildInitialState(taskId, maxIterations)` signature unchanged — `submission` starts as `undefined`, gets set on `task_submitted`.
+
+**3f. Test updates**
+
+All existing 19 tests updated to reflect:
+
+- Slim `room_completed` (no more `result: RoomRunResult` in commands/events)
+- New `plan` field on submit commands
+- New `start_room` command
+- `feedback` as `string[]` on reject
+- `submission` on public state
+- No synthesis enqueue when `plan.includeSynthesis === false`
+
+New tests:
+
+- `start_room` happy path and validation (room job must exist)
+- `plan.includeSynthesis === false` → domain complete goes directly to render
+- `plan.includeSynthesis === true` → domain complete enqueues synthesis (existing behavior)
+- `room_completed` with `"inconclusive"` outcome accepted
+- `feedback` as `string[]` round-trips through reject → rerun
+
+### 4. Storage Schema Additions
+
+**`packages/storage/src/index.ts`** — All changes in this single file.
+
+**4a. Auto-seq workflow event append**
+
+New function:
+
+```ts
+export interface PersistableWorkflowEvent {
+  readonly eventType: string;
+  readonly payloadJson: string;
+  readonly createdAtMs: number;
+}
+
+export function appendWorkflowEventsAutoSeq(
+  db: Database,
+  taskId: string,
+  events: readonly PersistableWorkflowEvent[],
+): readonly WorkflowEventRecord[];
+```
+
+Implementation: inside the caller's transaction, `SELECT COALESCE(MAX(seq), 0) FROM workflow_events WHERE task_id = ?`, then assign `base + index + 1` to each event. Returns the persisted records with assigned `seq` values.
+
+Existing `appendWorkflowEvents` stays for backward compatibility.
+
+**4b. Room artifacts table**
+
+```sql
+CREATE TABLE IF NOT EXISTS room_artifacts (
+  room_id TEXT NOT NULL PRIMARY KEY,
+  artifact_kind TEXT NOT NULL,
+  content TEXT NOT NULL,
+  path_hint TEXT,
+  created_at_ms INTEGER NOT NULL
+);
+```
+
+```ts
+export interface RoomArtifactRecord {
+  readonly roomId: string;
+  readonly artifactKind: string;
+  readonly content: string;
+  readonly pathHint: string | null;
+  readonly createdAtMs: number;
+}
+
+export function appendRoomArtifact(db: Database, artifact: RoomArtifactRecord): void;
+export function readRoomArtifact(db: Database, roomId: string): RoomArtifactRecord | null;
+```
+
+**4c. Review packets table**
+
+```sql
+CREATE TABLE IF NOT EXISTS review_packets (
+  task_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  packet_json TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY (task_id, version)
+);
+```
+
+```ts
+export interface ReviewPacketRecord {
+  readonly taskId: string;
+  readonly version: number;
+  readonly packetJson: string;
+  readonly createdAtMs: number;
+}
+
+export function writeReviewPacket(db: Database, packet: ReviewPacketRecord): void;
+export function readReviewPacket(
+  db: Database,
+  taskId: string,
+  version: number,
+): ReviewPacketRecord | null;
+export function readLatestReviewPacket(db: Database, taskId: string): ReviewPacketRecord | null;
+```
+
+**4d. Tasks derived index table**
+
+```sql
+CREATE TABLE IF NOT EXISTS tasks (
+  task_id TEXT NOT NULL PRIMARY KEY,
+  external_state TEXT NOT NULL,
+  internal_phase TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  latest_event_seq INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+```
+
+```ts
+export interface TaskIndexRecord {
+  readonly taskId: string;
+  readonly externalState: string;
+  readonly internalPhase: string;
+  readonly prompt: string;
+  readonly latestEventSeq: number;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+export function upsertTaskIndex(db: Database, task: TaskIndexRecord): void;
+export function readTaskIndex(db: Database, taskId: string): TaskIndexRecord | null;
+export function listRecoverableTasks(db: Database): readonly TaskIndexRecord[];
+```
+
+`listRecoverableTasks` returns rows where `external_state NOT IN ('approved', 'cancelled', 'failed')`.
+
+**4e. Migrations** — Add the 3 new `CREATE TABLE` statements to the migrations array. Existing tables unchanged.
+
+**4f. Tests** — Add tests for:
+
+- `appendWorkflowEventsAutoSeq`: correct seq assignment, sequential calls produce incrementing seqs
+- `appendRoomArtifact` + `readRoomArtifact`: round-trip, null for missing
+- `writeReviewPacket` + `readReviewPacket` + `readLatestReviewPacket`: round-trip, version ordering
+- `upsertTaskIndex` + `readTaskIndex` + `listRecoverableTasks`: insert, update, filter terminal states
+- Existing 6 storage tests remain passing
+
+### Test Strategy Summary
+
+| Package   | Existing | Updates                                                   | New Tests                                                       |
+| --------- | -------- | --------------------------------------------------------- | --------------------------------------------------------------- |
+| protocol  | 4        | Update for new types, optional fields                     | Schema tests for new wire types                                 |
+| workflow  | 19       | All 19 (room_completed shape, plan, feedback, submission) | ~5 (start_room, plan conditional, inconclusive, feedback array) |
+| storage   | 6        | None                                                      | ~8 (auto-seq, artifacts, packets, task index)                   |
+| config    | 10       | None                                                      | None                                                            |
+| room      | 22       | None                                                      | None                                                            |
+| providers | 26       | None                                                      | None                                                            |
+
+Room and providers tests should pass unmodified — room still produces `RoomRunResult`, providers still produce `AgentTurnOutput`. The slimming is at the workflow command boundary, not at the room output boundary.
+
+### Acceptance Criteria
+
+1. `bun run build` passes across all packages.
+2. `bun run typecheck` passes across all packages.
+3. `bun run check` (biome) passes.
+4. `bun run test` passes — all existing tests updated, all new tests passing.
+5. `scripts/check-boundaries.sh` passes (no boundary violations).
+6. Wire `TaskFailedEvent` uses `TaskFailureCode`, not `WireErrorCode`.
+7. Wire has `TaskSnapshotEvent`, `WireErrorEnvelope`, `WireServerMessage`.
+8. `IssueSummaryView.domain` is optional.
+9. `EvidenceTraceLinkView.sectionRef` is optional, `evidence` field added.
+10. `WorkflowState.submission` is public (not hidden in `_workflow`).
+11. `WorkflowPlan` controls synthesis: `includeSynthesis: false` → no synthesis job after domain completion.
+12. `start_room` command produces persisted `room_started` event with roomKind, domain, agentIds.
+13. `room_completed` command/event carries only roomId, roomKind, outcome — no `RoomRunResult`.
+14. `room_completed` accepts `"inconclusive"` outcome without throwing.
+15. Reject feedback is `readonly string[]` through workflow command, event, and job payload.
+16. Storage has `room_artifacts`, `review_packets`, `tasks` tables with working CRUD.
+17. `appendWorkflowEventsAutoSeq` assigns correct sequential seq values.
+
+### What must be complete before Phase 5
+
+This phase (4.5). All acceptance criteria met.
+
+---
+
 ## Phase 5 — Minimal server + CLI: first user-visible end-to-end path
 
 **Goal**
@@ -643,8 +1063,7 @@ Only implement: single domain room, static fixture ContextBundle, render domain 
 
 **What must be complete before this phase starts**
 
-- Phase 2 workflow/storage.
-- Phase 4 real provider turns.
+- Phase 4.5 pre-integration structural fixes.
 
 **Test strategy**
 
