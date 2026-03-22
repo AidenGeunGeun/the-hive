@@ -15,7 +15,9 @@
     "lint": "bun run check",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",
-    "test:pkg": "turbo run test --filter"
+    "test:pkg": "turbo run test --filter",
+    "smoke": "bun packages/server/scripts/smoke-test.ts",
+    "smoke:debug": "bun packages/server/scripts/smoke-test.ts --debug"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",
