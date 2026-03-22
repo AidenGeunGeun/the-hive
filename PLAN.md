@@ -1023,54 +1023,393 @@ This phase (4.5). All acceptance criteria met.
 Prove the architecture with one real task flowing through server, storage, room, provider, and CLI.
 
 **Packages involved**
-`@the-hive/server`, `@the-hive/cli`, `@the-hive/storage`, `@the-hive/workflow`, `@the-hive/room`, `@the-hive/providers`
+`@the-hive/server`, `@the-hive/cli`
 
-**Concrete deliverables**
-
-### Server
-
-Use Bun's native WebSocket server with `Bun.serve()`.
-
-Export:
-
-- `startHost(config): Promise<HostHandle>`
-- `handleWireCommand(envelope): Promise<void>`
-- `dispatchPendingJobs(taskId): Promise<void>`
-- `recoverIncompleteTasks(): Promise<void>`
-- `broadcastTaskEvent(event): void`
-
-Core server components:
-
-- `authority.ts` — single write queue, wraps `workflow.applyCommand`, persists resulting events/snapshots
-- `dispatch.ts` — executes jobs (v1: only `run_domain_room`)
-- `ws.ts` — subscribe/unsubscribe, snapshot-on-subscribe, push events
-
-### CLI
-
-Export:
-
-- `connectClient(url): Promise<ClientHandle>`
-- `submitTask(command): Promise<void>`
-- `subscribeTask(taskId): Promise<void>`
-- `approveTask(taskId): Promise<void>`
-- `cancelTask(taskId): Promise<void>`
-- `renderTaskTimeline(events): string`
-- `renderReviewPacket(packet): string`
+No other packages are modified. Server imports from protocol, workflow, storage, config, providers, room, and context (composition root). CLI imports from `protocol/wire` only.
 
 ### Scope of this phase
 
 Only implement: single domain room, static fixture ContextBundle, render domain report.md, transition to awaiting_review, approve / cancel. Do NOT add synthesis or query-back yet.
 
+Phase 5 guardrails enforced by the server:
+
+- `WorkflowPlan` always `{ includeSynthesis: false, allowQueryBack: false, allowRerun: false }`.
+- Multi-domain submissions accepted but limited to 1 domain room only (first domain used, rest ignored, or allow multiple — the workflow handles N domain rooms correctly regardless).
+- Room `renderedArtifact` must not be null — treat as `room_failed` if missing.
+- `evidenceLinks` always `[]` in ReviewPacketView.
+- `diffFromPrevious` always `undefined` in ReviewPacketView.
+
+### Server
+
+**File structure:**
+
+```
+packages/server/src/
+  index.ts           — startHost, stopHost exports
+  authority.ts       — serial write queue, command processing, transactional commits
+  dispatch.ts        — job execution, room construction, context stub, review packet building
+  projection.ts      — workflow commit → wire events, task snapshot builder
+  ws.ts              — WebSocket server, connection/subscription management
+  config-mapper.ts   — HiveConfig → provider registry + room spec construction
+```
+
+#### `authority.ts` — Serial write queue
+
+The single authority for all state mutations. Serializes workflow command processing.
+
+```ts
+export interface WorkflowCommit {
+  readonly taskId: TaskId;
+  readonly prevState: WorkflowState;
+  readonly nextState: WorkflowState;
+  readonly events: readonly PersistedWorkflowEvent[];
+  readonly jobs: readonly PendingJob[];
+}
+
+export interface PersistedWorkflowEvent {
+  readonly seq: number;
+  readonly event: WorkflowEvent;
+}
+
+export interface AuthorityDeps {
+  readonly db: DatabaseHandle;
+  readonly projector: WireProjector;
+  readonly broadcaster: (taskId: TaskId, events: readonly WireEvent[]) => void;
+  readonly dispatcher: (taskId: TaskId) => void;
+}
+
+export interface Authority {
+  handleWireCommand(envelope: WireCommandEnvelope): Promise<void>;
+  handleInternalCommand(command: WorkflowCommand): Promise<void>;
+  getTaskState(taskId: TaskId): WorkflowState | null;
+}
+```
+
+The command processing loop:
+
+1. Acquire serial lock (async mutex or queue — one command at a time).
+2. Load current `WorkflowState` for the task:
+   - Check in-memory cache first.
+   - If not cached: read from `tasks` table index for last known seq, then `readWorkflowEvents(taskId, afterSeq)` and `projectState(events, snapshot)`.
+   - If not in storage at all (new task): `buildInitialState(taskId, maxIterations)`.
+3. Call `applyCommand(state, command)` → `WorkflowTransition { newState, events, jobs }`.
+4. If no events emitted (idempotent duplicate): return early.
+5. In one write transaction:
+   - `appendWorkflowEventsAutoSeq(db, taskId, events)` → get persisted records with seq.
+   - `upsertTaskIndex(db, taskId, ...)` with data from `newState`.
+6. Update in-memory state cache.
+7. After commit:
+   - Call `projector.projectCommit(commit)` → wire events.
+   - Call `broadcaster(taskId, wireEvents)` to push to subscribed clients.
+   - Call `dispatcher(taskId)` to kick job processing.
+
+**Wire command → workflow command translation** (in authority):
+
+| Wire field                       | Workflow field        | Translation                        |
+| -------------------------------- | --------------------- | ---------------------------------- |
+| `submit_task.bundleInput.path`   | `bundleInputPath`     | `cmd.bundleInput.path`             |
+| `submit_task` (no plan field)    | `plan`                | Server injects Phase 5 plan        |
+| `approve_task.submittedAtMs`     | `timestamp`           | Field rename                       |
+| `reject_task.submittedAtMs`      | `timestamp`           | Field rename                       |
+| `reject_task.feedback`           | `feedback`            | Pass through (both `string[]`)     |
+| `cancel_task.submittedAtMs`      | `timestamp`           | Field rename                       |
+| `subscribe_task`                 | N/A                   | Not a workflow command — goes to ws |
+| `get_task_snapshot`              | N/A                   | Not a workflow command — goes to projection |
+
+Write commands (`submit_task`, `approve_task`, `reject_task`, `cancel_task`) go through the authority queue. Read commands (`subscribe_task`, `get_task_snapshot`) go directly to ws/projection without the authority queue.
+
+#### `dispatch.ts` — Job execution
+
+Picks up pending jobs from workflow state and executes them asynchronously.
+
+```ts
+export interface DispatcherDeps {
+  readonly db: DatabaseHandle;
+  readonly authority: Authority;
+  readonly config: HiveConfig;
+  readonly providerRegistry: ProviderRegistry;
+  readonly completeFn: CompleteFn;
+}
+
+export interface Dispatcher {
+  kick(taskId: TaskId): void;
+  recoverIncompleteTasks(): Promise<void>;
+  shutdown(): void;
+}
+```
+
+`kick(taskId)`: reads the task's current `WorkflowState`, iterates `pendingJobs`, and dispatches any unstarted jobs. Uses a `Set<string>` of in-flight `jobId`s to avoid duplicate dispatches.
+
+**Job handlers:**
+
+**`build_context_bundle`**: Phase 5 stub. Reads `bundleInputPath` from job payload. Creates a static fixture `ContextBundle` by reading files from the path (if it exists) or using a hardcoded fixture. Sends `context_bundle_built` command back to authority.
+
+**`run_domain_room`**: The core job.
+1. Read job payload: `{ roomId, domain, bundleId, iteration }`.
+2. Load `ContextBundle` (from the in-memory stub created during `build_context_bundle`).
+3. Build `RoomSpec` from config using `config-mapper.ts`:
+   - Find matching `RoomTemplateConfig` for the domain.
+   - Map `AgentTemplateConfig[]` → `AgentSpec[]` with `createAgentId()`.
+   - Map config policy names to kernel policy names (e.g. `"round_robin"` → `"roundRobinTurnPolicy"`).
+4. Create `Agent[]` via `createProviderAgent(spec, deps)` for each agent spec.
+5. Load system prompt: read `prompts/room-base.md` as base.
+6. Send `start_room` command to authority (persists `room_started` event).
+7. Call `runRoom(input)` — async, potentially long-running.
+8. Validate `renderedArtifact` is not null. If null: send `room_failed` to authority with `"render_failed"`.
+9. In one write transaction:
+   - `appendLedgerEntries(db, roomId, entries)` from `RoomRunResult.ledgerEntries`.
+   - `appendTurnTrace(db, roomId, trace)` for each trace in `RoomRunResult.turnTraces`.
+   - `appendRoomArtifact(db, artifact)` from `RoomRunResult.renderedArtifact`.
+10. Send `room_completed` command to authority with `{ roomId, roomKind: "domain", outcome }`.
+
+**`render_review_packet`**: Builds `ReviewPacketView` from persisted data.
+1. Read job payload: `{ version, iteration, sourceRoomIds, sourceStage }`.
+2. For each `sourceRoomId`: read `readLedgerEntries(db, roomId)` and `readRoomArtifact(db, roomId)`.
+3. Build `ReviewPacketView`:
+   - `proposalMarkdown`: rendered artifact content from the room(s).
+   - `unresolvedIssues`: parse ledger entries, find issues not in terminal state. Domain derived from room metadata.
+   - `riskProposals`: find `propose_closure` entries with `closureType: "risk_proposed"`. Extract `rationale` and `proposedBy` (agent_id) from the ledger entry.
+   - `contextGaps`: find `request_context` entries. Extract `requestedBy` from agent_id.
+   - `evidenceLinks`: `[]` (Phase 5).
+   - `diffFromPrevious`: `undefined` (Phase 5).
+4. `writeReviewPacket(db, { taskId, version, packetJson, createdAtMs })`.
+5. Send `review_packet_rendered` command to authority.
+
+**Late completion handling**: If a `room_completed` arrives after the task is cancelled, the authority's `applyCommand` will throw (task is terminal). The dispatcher should catch this and log it, not crash.
+
+**Recovery**: `recoverIncompleteTasks()`:
+1. Call `listRecoverableTasks(db)` → non-terminal tasks.
+2. For each: load state via `readWorkflowEvents` + `projectState`.
+3. Re-dispatch any pending jobs via `kick(taskId)`.
+4. In-flight rooms from before crash are lost — the pending job still exists, so they get re-dispatched.
+
+#### `projection.ts` — Wire event projection and view building
+
+```ts
+export interface WireProjector {
+  projectCommit(commit: WorkflowCommit): Promise<readonly WireEvent[]>;
+  buildTaskSnapshot(taskId: TaskId, state: WorkflowState): Promise<TaskSnapshotView>;
+}
+```
+
+**`projectCommit`** rules:
+
+- If `prevState.externalState !== nextState.externalState`: emit `TaskStateChangedEvent`.
+- For each `room_started` event in commit: emit `RoomStartedEvent` (wire) with roomKind, agentIds, startedAtMs from the workflow event.
+- For each `room_completed` event in commit: emit `RoomCompletedEvent` (wire) with roomKind, outcome, completedAtMs.
+- For each `task_review_ready` event in commit: load review packet from storage via `readReviewPacket`, emit `TaskReviewReadyEvent`.
+- For each `task_failed` event in commit: emit `TaskFailedEvent`, map workflow `errorCode` string to `TaskFailureCode` (use `"internal_error"` as fallback).
+- For each `task_cancelled` event in commit: emit `TaskCancelledEvent`.
+- Ignore internal-only events: `task_submitted`, `task_started`, `context_bundle_built`, `room_job_enqueued`, `review_packet_rendered`, `task_approved`, `task_rejected`.
+- Note: `task_approved` and `task_rejected` trigger `task_state_changed` via the externalState comparison, so they don't need explicit handling.
+
+**`buildTaskSnapshot`**: constructs `TaskSnapshotView` from `WorkflowState`:
+
+```ts
+{
+  taskId: state.taskId,
+  state: state.externalState,
+  prompt: state.submission?.prompt ?? "",
+  currentPhase: state.internalPhase,
+  roomSummaries: [], // Phase 5: empty, or build from persisted room lifecycle events
+  createdAtMs: state.createdAtMs,
+  updatedAtMs: state.updatedAtMs,
+}
+```
+
+#### `ws.ts` — WebSocket server
+
+```ts
+export interface WsServerDeps {
+  readonly authority: Authority;
+  readonly projector: WireProjector;
+  readonly db: DatabaseHandle;
+}
+
+export interface WsServer {
+  readonly server: ReturnType<typeof Bun.serve>;
+  broadcast(taskId: TaskId, events: readonly WireEvent[]): void;
+  shutdown(): void;
+}
+```
+
+Uses `Bun.serve()` with WebSocket upgrade.
+
+**Connection handling:**
+- On WebSocket `open`: track the connection.
+- On WebSocket `close`: remove from all task subscriptions.
+- On WebSocket `message`: parse JSON. Determine if `WireCommandEnvelope` (has `command` field). Validate `protocolVersion`. Route:
+  - Write commands (`submit_task`, `approve_task`, `reject_task`, `cancel_task`): forward to `authority.handleWireCommand(envelope)`. On error: send `WireErrorEnvelope` back.
+  - `subscribe_task`: add connection to task subscription set. Build and send `TaskSnapshotEvent` immediately (snapshot-on-subscribe). Then the connection receives future wire events for that task.
+  - `get_task_snapshot`: build and send `TaskSnapshotEvent` (one-shot, no subscription).
+
+**Subscriptions**: `Map<string, Set<ServerWebSocket>>` keyed by taskId.
+
+**Broadcasting**: for each wire event, wrap in `WireEventEnvelope` with protocol version, JSON.stringify, and send to all subscribed connections.
+
+**Error handling**: all command processing errors → `WireErrorEnvelope` with appropriate `WireErrorCode`. Workflow errors → `INVALID_STATE_TRANSITION`. Unknown commands → `UNKNOWN_COMMAND`. Parse failures → `INVALID_PAYLOAD`.
+
+#### `config-mapper.ts` — Composition wiring
+
+```ts
+export function mapToProviderRegistryConfig(config: HiveConfig): ProviderRegistryConfig;
+export function buildRoomSpecFromJob(
+  config: HiveConfig,
+  jobPayload: DomainRoomJobPayload,
+): RoomSpec<"domain">;
+export function mapPolicyNames(configPolicies: PolicyConfig): PolicySet;
+```
+
+**Policy name mapping**: Config uses short names (`"round_robin"`), kernel expects full names (`"roundRobinTurnPolicy"`). The mapper translates:
+
+| Config name                 | Kernel name                            |
+| --------------------------- | -------------------------------------- |
+| `round_robin`               | `roundRobinTurnPolicy`                 |
+| `no_open_objections`        | `noOpenObjectionStopPolicy`            |
+| `unresolved_issue_scoped`   | `unresolvedIssueScopedMemoryPolicy`    |
+| `retry_once_then_fail`      | `retryOnceThenFailFailurePolicy`       |
+| `domain_artifact`           | `domainArtifactPolicy`                 |
+| `synthesis_artifact`        | `synthesisArtifactPolicy`              |
+
+If no room template matches the domain, use the first domain-kind template as default.
+
+#### `index.ts` — Server entry point
+
+```ts
+export interface HostHandle {
+  readonly url: string;
+  readonly shutdown: () => Promise<void>;
+}
+
+export function startHost(config: HiveConfig): Promise<HostHandle>;
+```
+
+`startHost`:
+1. Open database, run migrations.
+2. Create provider registry from config.
+3. Create authority, dispatcher, projector, ws server.
+4. Wire dependencies together.
+5. Call `dispatcher.recoverIncompleteTasks()`.
+6. Return `HostHandle` with `shutdown()` that closes WS server, database, and cancels in-flight dispatches.
+
+### CLI
+
+**File structure:**
+
+```
+packages/cli/src/
+  index.ts     — CLI entry point, subcommand parsing
+  client.ts    — WebSocket client, send/receive
+  format.ts    — Terminal output formatting
+```
+
+**Subcommands:**
+
+```
+hive submit --prompt "..." --bundle-input /path [--server ws://localhost:PORT]
+hive watch <taskId> [--server ws://localhost:PORT]
+hive approve <taskId> [--server ws://localhost:PORT]
+hive cancel <taskId> [--server ws://localhost:PORT]
+hive snapshot <taskId> [--server ws://localhost:PORT]
+```
+
+Default server: `ws://localhost:4080`.
+
+**`submit`**: Creates `SubmitTaskCommand` with generated `commandId` and `taskId` (UUID). Sends as `WireCommandEnvelope`. Then auto-subscribes and follows the task until terminal state (like `watch`). Prints events as they arrive.
+
+**`watch`**: Sends `SubscribeTaskCommand`. Receives `TaskSnapshotEvent` first (current state), then streams `WireEventEnvelope` events. Prints each event formatted. Exits when a terminal state event arrives (`approved`, `failed`, `cancelled`). When `task_review_ready` arrives, prints the proposal markdown.
+
+**`approve`**: Sends `ApproveTaskCommand`. Waits for confirmation event (`task_state_changed` → approved), then exits.
+
+**`cancel`**: Sends `CancelTaskCommand`. Waits for confirmation event, then exits.
+
+**`snapshot`**: Sends `GetTaskSnapshotCommand`. Receives and prints `TaskSnapshotEvent`. Exits.
+
+#### `client.ts` — WebSocket client
+
+```ts
+export interface HiveClient {
+  send(envelope: WireCommandEnvelope): void;
+  onEvent(handler: (event: WireEvent) => void): void;
+  onError(handler: (error: WireError, commandId: string) => void): void;
+  close(): void;
+}
+
+export function connectToServer(url: string): Promise<HiveClient>;
+```
+
+Uses native `WebSocket` (available in Bun). Parses incoming messages as `WireServerMessage` — checks for `error` field (WireErrorEnvelope) vs `event` field (WireEventEnvelope).
+
+#### `format.ts` — Output formatting
+
+Simple text formatting, no color libraries. One function per event type:
+
+```ts
+export function formatEvent(event: WireEvent): string;
+export function formatSnapshot(snapshot: TaskSnapshotView): string;
+export function formatError(error: WireError): string;
+```
+
+Example output:
+```
+[task_state_changed] submitted → running (12:34:56)
+[room_started] room=abc123 kind=domain agents=3 (12:34:57)
+[room_completed] room=abc123 kind=domain outcome=completed (12:35:12)
+[task_review_ready] version=1 (12:35:13)
+--- PROPOSAL ---
+(proposal markdown content)
+--- END PROPOSAL ---
+[task_state_changed] awaiting_review → approved (12:35:30)
+```
+
+#### CLI boundary enforcement
+
+The CLI ONLY imports from `@the-hive/protocol/wire`. It constructs `WireCommandEnvelope` objects and parses `WireServerMessage` responses. It does NOT import from `protocol/engine` or any other package. This is enforced by CI boundary checks.
+
+### Test Strategy
+
+All server integration tests use `ScriptedAgent` (from `@the-hive/room`) to avoid LLM costs. The server creates agents via `createProviderAgent` in real code, but tests can inject scripted agents by providing a mock or by testing authority/dispatch/projection in isolation.
+
+**Server unit tests** (`packages/server/test/server.test.ts`):
+
+1. **Authority command processing**: Submit task → verify workflow events persisted, task index updated.
+2. **Authority idempotency**: Submit same commandId twice → second is no-op.
+3. **Wire → workflow translation**: Verify all field mappings for submit/approve/reject/cancel.
+4. **Projection**: Verify workflow commit → wire event mapping for each event type.
+5. **Dispatch build_context_bundle**: Verify stub creates valid ContextBundle and sends context_bundle_built.
+6. **Dispatch run_domain_room**: Full room lifecycle with ScriptedAgent — room runs, ledger/traces/artifact persisted, room_completed sent.
+7. **Dispatch render_review_packet**: Verify ReviewPacketView construction from persisted ledger entries.
+8. **Full e2e in-process**: submit_task → context_build → domain_room → render → awaiting_review → approve. Verify terminal state.
+9. **Full e2e with cancel**: submit_task → cancel mid-flight → verify cancelled state.
+10. **Recovery**: Persist partial state, create new dispatcher, call recoverIncompleteTasks, verify jobs re-dispatched.
+11. **Error handling**: Invalid command → WireErrorEnvelope returned.
+
+Tests 6-9 require an in-process server. Create the authority, dispatcher, and projector directly (no WS needed). Feed commands through `authority.handleWireCommand()` or `authority.handleInternalCommand()`.
+
+**CLI tests** are minimal for Phase 5 — the CLI is thin. Format tests only:
+
+12. **Format tests**: Verify `formatEvent` produces expected output for each event type.
+
+### Acceptance Criteria
+
+1. `bun run build` passes across all packages.
+2. `bun run typecheck` passes across all packages.
+3. `bun run check` (biome) passes.
+4. `bun run test` passes — all new server tests passing, all existing tests unmodified.
+5. `scripts/check-boundaries.sh` passes — CLI imports only `protocol/wire`.
+6. Server starts via `startHost(config)` and accepts WebSocket connections.
+7. CLI can submit a task, subscribe, and receive events.
+8. Full lifecycle works in-process: submit → context build → domain room → render → awaiting_review → approve.
+9. Review packet contains valid `proposalMarkdown` from room artifact, `riskProposals`, `contextGaps` from ledger.
+10. Crash recovery works: restart server → incomplete tasks re-dispatched.
+11. `WorkflowPlan` is always `{ includeSynthesis: false, allowQueryBack: false, allowRerun: false }`.
+12. Room `renderedArtifact === null` triggers `room_failed`.
+13. WireErrorEnvelope returned for invalid commands.
+14. All server integration tests use ScriptedAgent (no LLM calls).
+
 **What must be complete before this phase starts**
 
 - Phase 4.5 pre-integration structural fixes.
-
-**Test strategy**
-
-- In-process integration test: CLI sends submit_task -> server persists event -> room runs -> report renders -> task reaches awaiting_review -> CLI approves.
-- Duplicate command test using same commandId.
-- WS reconnect + resubscribe.
-- Crash recovery: kill server after room completion, before review broadcast; restart, recover correct state.
 
 **Integration checkpoint**
 
@@ -1078,8 +1417,9 @@ Only implement: single domain room, static fixture ContextBundle, render domain 
 
 **Risks**
 
-- The wire API needs a subscription/read model now. The architecture does not spell this out.
 - Do not add terminal polish before this flow works.
+- In-process integration tests may mask WS framing bugs. Verify WS manually at least once.
+- ScriptedAgent tests don't exercise provider normalization — that's covered by Phase 4 tests and the live harness.
 
 ---
 
